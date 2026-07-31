@@ -1,0 +1,1443 @@
+# Meridian Node Agent Design
+
+**Status:** Draft RFC
+
+**Repository:** `IMV-IN/meridian-node`
+
+**Companion repository:** `IMV-IN/Meridian`
+
+**Authors:** IMV-IN
+
+**Last updated:** 2026-07-31
+
+### Normative language
+
+The terms **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
+**MAY** are normative. Examples illustrate the contract but do not override the
+versioned JSON Schema and OpenAPI definitions. When prose and a released schema
+conflict, the released schema is authoritative for wire compatibility and this
+RFC must be corrected.
+
+## 1. Executive Summary
+
+`meridian-node` is a privileged, host-local agent for GPU inference servers. It
+connects outbound to a central Meridian control plane, reports host/GPU/model/
+engine state, reconciles an approved desired state, supervises inference
+engines, and reports when an endpoint is genuinely ready to serve traffic.
+
+The agent is deliberately a separate repository and deployable from the central
+Meridian gateway. The gateway is the fleet's authenticated API and routing
+authority. The node agent is the host's execution authority. Neither component
+should silently become the other:
+
+```text
+Central Meridian decides WHAT should run and WHETHER it may receive traffic.
+meridian-node decides HOW to make it run safely on one GPU host.
+```
+
+The first implementation must not attempt to replace Kubernetes, Slurm,
+Terraform, Ansible, Docker, or systemd as a general scheduler. It should provide
+a narrow, declarative contract for a Meridian-managed inference assignment and
+use the host's native runtime where possible.
+
+## 2. Decision Summary
+
+This RFC makes the following decisions:
+
+1. `meridian-node` is a separate repository, package, binary, container, and
+   release train.
+2. The agent initiates all control-plane connections. The control protocol does
+   not require an inbound agent listener. First-release application traffic uses
+   a separate private gateway-to-engine network path and therefore does require
+   an engine serving port reachable from Meridian gateway nodes.
+3. Agent-to-control-plane communication uses HTTPS with node identity, with
+   mTLS as the target production mechanism. A short-lived enrollment token is
+   allowed only for bootstrap.
+4. The protocol is versioned, JSON-based HTTPS for the first release. It uses
+   heartbeat plus long-polling before introducing a persistent streaming protocol.
+5. Desired state is declarative and generation-based. The agent reconciles a
+   complete snapshot idempotently; it does not execute arbitrary shell commands
+   from the server.
+6. Model artifacts are content-addressed and verified before use. Mutable model
+   aliases are resolved centrally to immutable revisions and digests.
+7. Engine lifecycle is represented by explicit states and conditions. Process
+   liveness, model readiness, agent lease, and gateway routability are separate.
+8. The central control plane must drain an endpoint before the agent stops or
+   replaces an engine.
+9. Static YAML backends remain supported in Meridian. Node-managed engines are a
+   second inventory provider during migration.
+10. Kubernetes-native engine workloads are preferred in Kubernetes deployments.
+    The node agent should not launch host processes that compete with a cluster
+    scheduler unless that mode is explicitly selected.
+11. The first managed deployment profile is a Linux GPU host running a pinned
+    vLLM OCI container through Docker Engine. Observe-only mode may support other
+    environments earlier, but their process lifecycle is not managed.
+12. Production managed-host mode is blocked until mTLS enrollment, credential
+    rotation, revocation, lease fencing, and artifact verification are enabled.
+
+## 3. Goals and Non-Goals
+
+### 3.1 Goals
+
+- Give each GPU host a stable, cryptographically bound identity.
+- Discover NVIDIA GPUs, including MIG devices where available.
+- Report agent, host, GPU, artifact, and engine observations to Meridian.
+- Maintain a lease so stale or partitioned nodes stop receiving new traffic.
+- Reconcile approved engine assignments after agent or engine restarts.
+- Manage model artifacts with resumable transfer, digest verification, atomic
+  promotion, and disk-pressure safety.
+- Support a small driver interface for vLLM, SGLang, Ollama, and generic
+  OpenAI-compatible engines.
+- Expose engine readiness only after the requested model revision is loaded and
+  the endpoint contract has passed.
+- Support graceful drain and bounded shutdown.
+- Preserve operation during temporary control-plane outages using the last
+  accepted desired state and explicit safety limits.
+- Provide auditable, structured state transitions without logging prompts or
+  generated content.
+- Make protocol compatibility independently testable across repositories.
+
+### 3.2 Non-goals for the initial design
+
+- General-purpose host orchestration.
+- Arbitrary remote command execution.
+- Central SSH management.
+- GPU scheduling across arbitrary workloads.
+- Replacing Kubernetes, Slurm, or an existing infrastructure provisioning system.
+- Automatic model selection based on prompt content.
+- Distributed inference across nodes.
+- A public model marketplace or model licensing service.
+- Collection of prompts, completions, or raw application payloads.
+- Full engine-specific optimization in the first agent release.
+
+## 4. Terminology
+
+| Term | Meaning |
+|---|---|
+| Control plane | Central Meridian APIs and durable state that define identity, desired assignments, leases, and routability. |
+| Node | One physical or virtual host running `meridian-node`. |
+| Host boot ID | Operating-system boot identity. It changes on host reboot, not agent restart. |
+| Agent session ID | A random identifier generated on every agent process start. It fences messages from prior agent processes. |
+| GPU device | A physical GPU or MIG compute instance with a stable device identifier. |
+| Artifact | An immutable model/runtime payload identified by a digest. |
+| Engine assignment | A desired declaration to run one engine/model endpoint on a node. |
+| Engine instance | The observed local process/container corresponding to an assignment. |
+| Endpoint | The OpenAI-compatible HTTP endpoint exposed by an engine instance. |
+| Lease | A time-bounded permission for a node session to remain active in the control plane. |
+| Generation | Monotonically increasing desired-state version for a node or assignment. |
+| Admission | The central gateway's decision to send new requests to an endpoint. |
+| Drain | Transition in which an endpoint receives no new work while existing work completes. |
+| Condition | A typed status statement with truth value, reason, message, and observation time. |
+
+## 5. Product Boundary
+
+```mermaid
+flowchart LR
+    A[Applications] --> G[Central Meridian gateway]
+    G --> E1[Engine endpoint A]
+    G --> E2[Engine endpoint B]
+    G --> E3[Engine endpoint C]
+
+    subgraph CP[Central Meridian control plane]
+      API[Control API]
+      DB[(Durable inventory and desired state)]
+      PROJ[Serving endpoint projection]
+      API --> DB
+      DB --> PROJ
+    end
+
+    G -. consumes routable projection .-> PROJ
+
+    subgraph H1[GPU host A]
+      N1[meridian-node]
+      S1[Engine supervisor]
+      C1[Artifact cache]
+      D1[GPU and host inventory]
+      N1 --> S1
+      N1 --> C1
+      N1 --> D1
+      S1 --> E1
+    end
+
+    subgraph H2[GPU host B]
+      N2[meridian-node]
+      S2[Engine supervisor]
+      C2[Artifact cache]
+      D2[GPU and host inventory]
+      N2 --> S2
+      N2 --> C2
+      N2 --> D2
+      S2 --> E2
+    end
+
+    subgraph H3[GPU host C]
+      N3[meridian-node]
+      S3[Engine supervisor]
+      C3[Artifact cache]
+      D3[GPU and host inventory]
+      N3 --> S3
+      N3 --> C3
+      N3 --> D3
+      S3 --> E3
+    end
+
+    N1 -. outbound mTLS .-> API
+    N2 -. outbound mTLS .-> API
+    N3 -. outbound mTLS .-> API
+```
+
+### 5.1 Central Meridian owns
+
+- Application-facing OpenAI-compatible API.
+- Tenant authentication, authorization, budgets, and policy.
+- Fleet-level desired state and assignment ownership.
+- Node enrollment, certificate lifecycle, and lease status.
+- Placement decisions and assignment approval.
+- Admission into the serving pool.
+- Endpoint draining coordination.
+- Fleet-wide audit metadata and operator views.
+- Aggregation of node observations and serving metrics.
+
+### 5.2 `meridian-node` owns
+
+- Local host and GPU inventory.
+- Local artifact cache and digest verification.
+- Translation of an approved assignment into a validated engine invocation.
+- Engine process/container lifecycle.
+- Local readiness probes and restart backoff.
+- Local state durability across agent restarts.
+- Reporting observed state and conditions.
+- Refusing unsafe or impossible assignments.
+
+### 5.3 Infrastructure systems own
+
+- Host provisioning and patching.
+- GPU driver and device-plugin installation.
+- Network, DNS, firewall, and TLS trust distribution.
+- Kubernetes/Slurm scheduling when the deployment uses those systems.
+- Registry and artifact mirror availability.
+- Secret bootstrap policy.
+
+## 6. Operating Modes
+
+The agent must support explicit modes rather than inferring ownership from the
+environment.
+
+### 6.1 Observe-only
+
+The agent discovers existing engines and reports them. It cannot start, stop,
+or replace processes. This is the default for initial installation and the
+recommended migration mode.
+
+### 6.2 Managed-host
+
+The agent may manage processes or containers listed in approved desired state.
+Drivers and resource policies are local allow-listed configuration. It may not
+execute arbitrary commands supplied by the control plane.
+
+### 6.3 Kubernetes-integrated
+
+The agent reports node/GPU inventory and may manage a narrow local cache, while
+the central controller creates native Kubernetes workloads. The agent does not
+launch a second copy of a Kubernetes-managed engine.
+
+### 6.4 Air-gapped
+
+The agent consumes preloaded signed bundle manifests and local artifact files.
+No network download is required. The same digest and readiness rules apply.
+
+### 6.5 First-release deployment profile
+
+To avoid making safety-critical behavior conditional on unresolved runtime
+choices, the first managed release has this concrete profile:
+
+| Concern | First-release decision |
+|---|---|
+| Host | Linux with systemd |
+| Agent installation | Dedicated systemd service and OS user |
+| Engine runtime | Docker Engine through a narrowly configured runtime adapter |
+| Engine | vLLM, one pinned image digest |
+| Central database | PostgreSQL |
+| Control transport | HTTPS with mandatory node mTLS after enrollment |
+| Application transport | Meridian connects directly to a private engine address |
+| Artifact source | Approved HTTPS/Hugging Face mirror plus signed manifest |
+| GPU provider | NVIDIA NVML; MIG is inventory-only until reservation tests pass |
+| Model replacement | Stop-after-drain; no in-place model mutation |
+
+The engine listener MUST bind only to an explicitly configured private interface.
+The central control plane validates the reported IP against the node's enrolled
+network ranges. Engine traffic SHOULD use mTLS or a node-specific upstream token;
+plain HTTP is permitted only on an explicitly trusted private network in the
+first release. Application traffic never traverses the heartbeat connection.
+
+## 7. Repository and Package Layout
+
+The repository starts with contracts and design tests before implementation:
+
+```text
+meridian-node/
+├── DESIGN.md
+├── README.md
+├── LICENSE
+├── pyproject.toml
+├── contracts/
+│   └── v1/
+│       ├── common.schema.json
+│       ├── enrollment.schema.json
+│       ├── heartbeat.schema.json
+│       ├── desired-state.schema.json
+│       ├── observed-state.schema.json
+│       └── openapi.yaml
+├── src/meridian_node/
+│   ├── cli.py
+│   ├── agent.py
+│   ├── config.py
+│   ├── identity/
+│   ├── control/
+│   ├── inventory/
+│   ├── artifacts/
+│   ├── engines/
+│   ├── supervisor/
+│   ├── reconcile/
+│   ├── state/
+│   └── observability/
+├── tests/
+│   ├── contract/
+│   ├── unit/
+│   ├── integration/
+│   └── fixtures/
+├── deploy/
+│   ├── systemd/
+│   ├── docker/
+│   └── kubernetes/
+└── docs/
+    ├── INSTALL.md
+    ├── SECURITY.md
+    └── ENGINE_DRIVERS.md
+```
+
+Python is the initial implementation language because the central Meridian
+project is Python, NVML bindings are available, and the first agent is largely
+HTTP, filesystem, subprocess, and container integration. The protocol must not
+depend on Python internals; a future agent implementation in Go or Rust should
+remain possible.
+
+## 8. Domain Model
+
+The following resources are distinct. They must not be collapsed into one
+`Backend` object.
+
+### 8.1 Node
+
+```json
+{
+  "node_id": "node_01J...",
+  "display_name": "gpu-host-a",
+  "host_boot_id": "linux-boot-id...",
+  "agent_session_id": "session_01J...",
+  "agent_version": "0.1.0",
+  "protocol_version": "v1",
+  "mode": "managed-host",
+  "labels": {"zone": "in-west-1a", "rack": "r12"},
+  "lease": {
+    "last_heartbeat_at": "2026-07-31T12:00:00Z",
+    "expires_at": "2026-07-31T12:00:30Z"
+  },
+  "conditions": [
+    {"type": "AgentConnected", "status": "True", "reason": "Heartbeat", "observed_at": "2026-07-31T12:00:00Z"}
+  ]
+}
+```
+
+`node_id` is generated during enrollment and persisted locally. Hostnames are
+display metadata only and MUST NOT be identity. `host_boot_id` is read from the
+operating system. `agent_session_id` changes on every agent process start and
+fences delayed messages from a prior process.
+
+The server stores one active session and a monotonically increasing
+`fencing_epoch` per node. Possession of the durable node key is necessary but is
+not sufficient to replace a live session. A new session is established only
+when the previous lease has expired, the active session releases a single-use
+handoff token, or an operator explicitly fences the old session. Establishment
+increments the epoch and returns a short-lived, server-signed session assertion
+binding `node_id`, `agent_session_id`, `fencing_epoch`, certificate key ID, and
+expiry.
+
+A message is accepted only when its certificate maps to the path `node_id`, its
+session ID and fencing epoch equal the active values, and its sequence is greater
+than the highest accepted sequence. Prior epochs receive `409
+STALE_AGENT_SESSION` and can never reactivate themselves merely by choosing a
+new session ID. The agent also holds an exclusive OS file lock, but the central
+epoch is the security boundary. The session-establishment endpoint is `POST
+/control/v1/nodes/{node_id}/sessions`; it is authenticated by the node
+certificate and returns the new epoch plus the session assertion. It is accepted
+only after the previous lease has expired, an explicit handoff token is supplied,
+or an operator fence record exists. A new session MAY adopt an engine owned by the
+same durable `node_id` after verifying the complete ownership record.
+
+### 8.2 GPU device
+
+Each device reports a stable UUID where the platform provides one. MIG devices
+are children of a physical GPU and are never represented as interchangeable
+physical devices.
+
+Required fields:
+
+- `device_id`, `parent_device_id`, `kind` (`physical` or `mig`)
+- vendor, model, architecture, PCI address
+- total/free/used memory in bytes
+- driver, CUDA/ROCm, and runtime versions
+- health and observation timestamp
+- allocation/reservation references
+
+The agent must not claim free capacity without an observation timestamp. The
+control plane treats stale inventory as unknown, not as available capacity.
+
+### 8.3 Model artifact
+
+An artifact is immutable after verification:
+
+```json
+{
+  "artifact_id": "artifact_qwen25_05b",
+  "source": {"kind": "huggingface", "uri": "Qwen/Qwen2.5-0.5B-Instruct"},
+  "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "manifest_digest": "sha256:manifest...",
+  "size_bytes": 1234567890,
+  "format": "safetensors",
+  "quantization": "none",
+  "verification": "verified"
+}
+```
+
+Aliases such as `Qwen/Qwen2.5-0.5B-Instruct:latest` are not valid assignment
+references. The central plane resolves aliases before publishing desired state.
+
+### 8.4 Engine assignment
+
+An assignment is desired state, not proof that a process exists:
+
+```json
+{
+  "engine_id": "engine_01J...",
+  "node_id": "node_01J...",
+  "generation": 42,
+  "desired_phase": "Running",
+  "engine": {
+    "kind": "vllm",
+    "image_digest": "sha256:image...",
+    "version": "0.10.2"
+  },
+  "artifact": {
+    "artifact_id": "artifact_qwen25_05b",
+    "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "manifest_digest": "sha256:manifest...",
+    "engine_image_digest": "sha256:image..."
+  },
+  "resources": {
+    "device_ids": ["GPU-..."],
+    "memory_limit_bytes": 7516192768,
+    "port": 8000
+  },
+  "parameters": {
+    "served_model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "max_model_len": 4096,
+    "tensor_parallel_size": 1
+  },
+  "policy": {
+    "restart": {"max_attempts": 5, "backoff_seconds": 30},
+    "drain_timeout_seconds": 120
+  }
+}
+```
+
+The top-level `engine.image_digest` MUST equal `artifact.engine_image_digest`.
+The agent validates both values against the signed manifest and selected driver
+schema and local policy. Unknown parameters are rejected by default. Observed
+engine ownership, readiness, and central routability all carry both exact digest
+values; a missing or mismatched value is not routable.
+
+### 8.5 Observed engine
+
+Observed state includes process/container identity, phase, readiness, restart
+count, assigned devices, loaded artifact digest, endpoint, resource use, and the
+last failure condition. A process being alive is not equivalent to serving the
+requested model.
+
+## 9. Lifecycle State Machines
+
+### 9.1 Node session
+
+```mermaid
+stateDiagram-v2
+    [*] --> Enrolling
+    Enrolling --> Connected : enrollment accepted
+    Connected --> Connected : heartbeat renewed
+    Connected --> Unknown : lease expired
+    Unknown --> Connected : session re-established after lease expiry
+    Connected --> Replaced : newer agent session accepted
+    Unknown --> Replaced : newer agent session accepted
+    Connected --> Revoked : certificate revoked
+    Unknown --> Revoked : certificate revoked
+    Replaced --> [*]
+    Revoked --> [*]
+```
+
+Lease expiry is a safety event. The central gateway must remove the node's
+endpoints from new-request admission after expiry, even if the last observed
+engine endpoint still responds to a direct probe.
+
+### 9.2 Engine assignment
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Pulling : artifact missing
+    Pending --> Starting : artifact verified
+    Pulling --> Starting : download and verify complete
+    Pulling --> Failed : digest or transfer failure
+    Starting --> Warming : process alive
+    Starting --> Failed : launch failure
+    Warming --> Ready : model and endpoint probe pass
+    Warming --> Failed : readiness timeout
+    Ready --> Draining : desired stop or replacement
+    Ready --> Failed : process or readiness failure
+    Failed --> Pending : retry budget permits
+    Failed --> Quarantined : retry budget exhausted
+    Draining --> Stopped : stop predicate satisfied
+    Stopped --> Pending : new generation requests running
+    Quarantined --> Pending : operator reset
+    Stopped --> [*]
+```
+
+### 9.3 Routability
+
+Routability is derived centrally and is not set by an agent heartbeat alone:
+
+```text
+Routable =
+    node lease valid
+    AND assignment desired_phase == Running
+    AND engine observed phase == Ready
+    AND manifest digest and OCI image digest match desired values
+    AND endpoint verification passed
+    AND endpoint is not draining
+    AND policy admission allows it
+```
+
+The gateway's existing endpoint health and local request observations remain
+separate from the agent's node lease and engine conditions. A transient gateway
+probe failure should not erase the node's inventory; an expired lease should
+still block routing immediately.
+
+### 9.4 Lease timeline
+
+Server time is authoritative. Agent-provided timestamps are diagnostic only.
+The first release uses these defaults, configurable within bounded server policy:
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| Heartbeat interval | 10 seconds | Agent target between successful heartbeats. |
+| Lease TTL | 30 seconds | Time after a server-accepted heartbeat during which the node lease is valid. |
+| Admission staleness bound | 5 seconds | Maximum time a gateway replica may use an older serving projection revision. |
+| Agent outage grace | 5 minutes | Time the agent may preserve already-running engines without accepting lifecycle changes. |
+| Certificate lifetime | 24 hours | Node credential validity, rotated before 50% of lifetime remains. |
+
+The server computes `lease_expires_at = server_received_at + lease_ttl`. Gateway
+admission MUST stop no later than `lease_expires_at + admission_staleness_bound`.
+The agent's outage grace does not extend central routability; it only avoids
+killing a healthy local process during a short central outage. After lease loss,
+the engine may keep existing direct connections but receives no new requests
+from conforming Meridian gateways. Reconnection with a valid certificate
+re-establishes the session under a new fencing epoch after lease expiry;
+re-enrollment is required only after credential loss, expiry without permitted
+renewal, or revocation.
+
+## 10. Control-Plane Protocol
+
+The initial protocol is HTTPS JSON. All timestamps are RFC 3339 UTC. All IDs
+are opaque strings with a maximum length of 128 characters. All request bodies
+have bounded size. Every mutating request carries an idempotency key or a
+monotonic session sequence.
+
+### 10.1 Bootstrap enrollment
+
+Enrollment is the only endpoint that accepts a bootstrap token. Tokens are
+single-use, short-lived, scoped to an installation or node claim, and never
+returned in logs.
+
+```http
+POST /control/v1/enroll
+Authorization: Bearer <one-time-bootstrap-token>
+Content-Type: application/json
+```
+
+```json
+{
+  "agent_version": "0.1.0",
+  "protocol_versions": ["v1"],
+  "node_public_key": "base64url...",
+  "csr": "base64url...",
+  "host_claims": {"hostname": "gpu-host-a", "platform": "linux"},
+  "host_boot_id": "linux-boot-id...",
+  "agent_session_id": "session_01J..."
+}
+```
+
+The response contains an assigned `node_id`, a node certificate, trust bundle,
+lease parameters, and the accepted protocol version. The server must reject a
+replayed token, a session ID already used by another active certificate, or a
+protocol with no compatible version. Re-enrollment after key loss requires
+operator revocation of the old certificate.
+
+### 10.2 Heartbeat
+
+```http
+POST /control/v1/nodes/{node_id}/heartbeat
+Authorization: Bearer <node certificate>
+Content-Type: application/json
+Idempotency-Key: <agent-session-id>:<fencing-epoch>:<sequence>
+```
+
+```json
+{
+  "host_boot_id": "linux-boot-id...",
+  "agent_session_id": "session_01J...",
+  "fencing_epoch": 7,
+  "sequence": 1842,
+  "sent_at": "2026-07-31T12:00:00Z",
+  "agent": {"version": "0.1.0", "protocol": "v1", "mode": "managed-host"},
+  "inventory_digest": "sha256:...",
+  "gpus": [],
+  "artifacts": [],
+  "engines": [],
+  "conditions": []
+}
+```
+
+The server response includes server time, accepted sequence, fencing epoch, lease expiry,
+desired-state generation, an admission projection revision, and the complete
+desired snapshot or a content-addressed reference to fetch it. A response MUST
+be safe to retry. A heartbeat is acknowledged only after the node observation
+and sequence are durably committed.
+
+### 10.3 Common errors
+
+All non-2xx responses use this bounded envelope:
+
+```json
+{
+  "error": {
+    "code": "STALE_AGENT_SESSION",
+    "message": "agent session is no longer active",
+    "retryable": false,
+    "request_id": "req_01J...",
+    "server_time": "2026-07-31T12:00:00Z"
+  }
+}
+```
+
+The first release maps errors as follows:
+
+| HTTP | Codes | Agent behavior |
+|---:|---|---|
+| 400 | `INVALID_REQUEST`, `UNSUPPORTED_SCHEMA` | Do not retry without configuration or version change. |
+| 401/403 | `INVALID_CREDENTIAL`, `NODE_NOT_AUTHORIZED` | Stop control actions; alert. |
+| 409 | `STALE_AGENT_SESSION`, `LOWER_GENERATION`, `CONFLICT` | Refresh state; never apply the rejected operation. |
+| 404 | `NODE_NOT_FOUND`, `GENERATION_NOT_FOUND` | Re-enroll or request a full snapshot according to code. |
+| 429 | `RATE_LIMITED` | Honor `Retry-After` with jitter. |
+| 500/503 | `CONTROL_UNAVAILABLE` | Retry with bounded backoff and preserve last accepted state. |
+
+Long-poll requests have a 30-second server timeout and are safe to cancel.
+Request bodies are capped at 4 MiB, excluding separately fetched artifact data.
+The server returns `Date` and `server_time`; the agent uses server time for lease
+decisions and rejects a clock skew greater than five minutes for enrollment.
+
+### 10.4 Desired state fetch
+
+```http
+GET /control/v1/nodes/{node_id}/desired-state?generation=41
+Authorization: Bearer <node certificate>
+If-None-Match: "generation-41"
+```
+
+The response is either `304 Not Modified` or the complete generation snapshot.
+The agent writes the snapshot durably before acknowledging it and never applies
+a lower generation than the currently accepted generation.
+
+### 10.5 Observed-state acknowledgement
+
+```http
+POST /control/v1/nodes/{node_id}/observations
+```
+
+The body contains the node `agent_session_id`, latest desired generation observed, engine
+conditions, artifact conditions, endpoint details, and optional failure data.
+The server stores the newest observation by `(node_id, agent_session_id, sequence)` and
+ignores older or duplicate sequences.
+
+### 10.6 Drain coordination
+
+The control plane first creates a durable `drain_id`, increments an
+`admission_epoch`, and publishes an endpoint withdrawal to every gateway
+replica. Each replica acknowledges the epoch through the shared serving
+projection. The control plane records two separate outcomes:
+`all_replicas_withdrawn=true` only when every required replica has acknowledged,
+and `withdrawal_timed_out=true` when the configured timeout expires first. A
+timed-out replica is treated as still able to route. The agent MUST NOT stop the
+engine on timeout unless the operator explicitly selects forced replacement.
+
+The agent receives the drain instruction through the next heartbeat response or
+desired-state fetch. It must persist the instruction, acknowledge receipt, and
+report progress. It does not stop the engine until the central plane's
+mTLS-authenticated response says `all_replicas_withdrawn=true`, or until an
+explicit operator force authorization is present, except for a local emergency
+policy.
+
+```json
+{
+  "engine_id": "engine_01J...",
+  "generation": 43,
+  "desired_phase": "Draining",
+  "drain": {
+    "drain_id": "drain_01J...",
+    "admission_epoch": 91,
+    "all_replicas_withdrawn": true,
+    "withdrawal_timed_out": false,
+    "force_authorized": false,
+    "deadline": "2026-07-31T12:02:00Z",
+    "force_after_deadline": true
+  }
+}
+```
+
+The agent reports `inflight_count`, `active_stream_count`,
+`last_request_started_at`, `drain_started_at`, `forced_at`, and the applied
+admission epoch. Existing streaming requests accepted before withdrawal may
+complete until the deadline. New requests after withdrawal MUST be rejected or
+routed elsewhere; the gateway may retry only safe, non-streaming requests.
+The single stop predicate is:
+
+```text
+can_stop =
+    all_replicas_withdrawn
+    AND (inflight_count == 0 OR deadline_reached)
+    AND (NOT deadline_reached OR force_authorized)
+```
+
+`force_after_deadline` is only a deadline behavior flag; it is not authorization.
+The local emergency policy is the only exception. At the deadline, if
+`force_authorized=false`, the agent remains `Draining` indefinitely and reports
+the blocked condition. If `force_authorized=true`, it force-stops after reporting
+the deadline transition; active streams may fail and the gateway must surface
+that failure rather than claim successful completion. A disconnected agent that
+cannot obtain `all_replicas_withdrawn` therefore never stops solely because its
+local drain deadline elapsed.
+
+The gateway must expose drain progress and projection revision. This is a
+cross-repository contract and requires an implementation change in central
+Meridian before managed replacement is enabled.
+
+## 11. Reconciliation Algorithm
+
+The agent uses a durable local state store. Its main loop is:
+
+```text
+Desired snapshot generation N
+  assignments: complete set for node
+  snapshot_hash: sha256 of canonical JSON
+  deleted assignments: absent from set, with deletion tombstone in snapshot
+```
+
+The desired snapshot is complete for one node. An assignment absent from a
+newer snapshot is a deletion request and transitions through `Draining` before
+`Stopped`. A snapshot generation MAY skip numbers, but the agent applies only a
+generation greater than its durable accepted generation. Each assignment has an
+immutable `engine_id` and a `spec_revision`; changing image digest, artifact
+digest, device set, port, or replacement-class parameters creates a replacement
+operation. Mutable operational policy changes MAY be applied in place only when
+the driver explicitly declares them safe.
+
+```text
+1. Load the last accepted desired generation and observed local state.
+2. Discover current host/GPU/process/container/artifact state.
+3. Renew the node lease and fetch a newer desired snapshot if available.
+4. Validate desired state against local policy, resources, and driver support.
+5. For each assignment, compute a deterministic desired-versus-observed diff.
+6. Execute one bounded operation at a time per GPU/device allocation.
+7. Persist operation intent before side effects.
+8. Verify side effects through probes and process identity checks.
+9. Publish observed conditions with a new sequence.
+10. Retry transient failures with bounded exponential backoff.
+11. Quarantine repeated failures rather than crash-looping indefinitely.
+```
+
+Reconciliation must be idempotent:
+
+- Reapplying generation 42 after a timeout must not start a second engine.
+- A completed download must be recognized by digest and size.
+- A process may be adopted only if its command/image, model digest, assigned
+  devices, and ownership marker match the assignment.
+- A process with an unknown ownership marker must not be killed automatically.
+- A stale agent session must not apply a newer desired state fetched for another
+  agent session.
+- A failed operation must leave a condition explaining whether retry is safe.
+
+### 11.3 Operation journal
+
+The first release uses SQLite in WAL mode on the local state volume. The agent
+MUST fsync committed journal rows before acknowledging a side effect that cannot
+be safely repeated. The journal has these states:
+
+```text
+planned -> started -> side_effect_observed -> committed
+                    \-> uncertain
+```
+
+Each journal row contains `operation_id`, canonical request digest, engine ID,
+agent session ID, fencing epoch, helper request nonce, side-effect type, and the
+last helper result. The helper durably stores `operation_id -> request_digest,
+status, result` in its root-owned journal before returning. It returns the same
+result for an exact duplicate and rejects a reused operation ID with a different
+request digest. `inspect(operation_id)` is available after agent restart so the
+agent can resolve an uncertain launch or stop without repeating it. Destructive
+operations are never retried unless the helper reports that the prior operation
+was not executed.
+
+Crash recovery rules:
+
+| Crash point | Recovery |
+|---|---|
+| Before `started` | Discard or retry the plan. |
+| After `started`, no observation | Re-discover and identify the process/container; never launch a duplicate until identity is resolved. |
+| After side effect, before commit | Reconcile from observed filesystem/runtime state and commit the matching result. |
+| `uncertain` operation | Require a driver-specific inspect result or operator action; do not repeat a potentially destructive operation automatically. |
+| State database unavailable/full | Stop lifecycle mutations, preserve known processes, report `StateStoreUnavailable`, and alert. |
+| Database corruption | Move the database aside only after preserving a copy, enter observe-only, and require operator-approved recovery. |
+
+Acknowledgement meanings are distinct: `received` means bytes passed schema
+validation; `persisted` means durable desired state; `applied` means the agent
+completed the requested local operation; `observed` means a subsequent probe
+confirmed the result. Heartbeats acknowledge only `persisted` observations and
+return the latest `observed` conditions.
+
+### 11.1 Local operation locking
+
+Operations that affect one GPU allocation are serialized. The local store holds
+ an ownership record containing `node_id`, `agent_session_id`, `engine_id`, generation,
+operation ID, start time, and expiry. An expired operation can be recovered only
+after re-checking process identity and filesystem state.
+
+### 11.2 Crash recovery
+
+On restart, the agent must:
+
+1. Read `host_boot_id` and generate a new `agent_session_id`.
+2. Re-enroll or renew according to the credential policy.
+3. Discover existing processes and containers.
+4. Adopt only resources with valid ownership metadata and matching assignment.
+5. Mark unmatched processes as `Orphaned` and leave them running by default.
+6. Report orphaned resources for operator action.
+7. Resume the last accepted desired generation after lease acceptance.
+
+## 12. Artifact Management
+
+The cache is content-addressed under a controlled root:
+
+```text
+/var/lib/meridian-node/
+├── state.db
+├── artifacts/
+│   └── sha256/<digest>/
+├── staging/
+├── engines/
+├── logs/
+└── run/
+```
+
+Rules:
+
+- Downloads go to a staging path, never directly into an active artifact.
+- Size limits and available-space checks happen before transfer.
+- Resumption is allowed only when source metadata and partial digest state are
+  compatible.
+- Verification requires the expected digest, not merely a successful HTTP 200.
+- Promotion is atomic through rename on the same filesystem.
+- The engine receives a read-only or immutable artifact path where possible.
+- Active and pinned artifacts cannot be evicted.
+- Eviction is least-recently-used only among unpinned, unassigned artifacts.
+- Air-gap imports use the same manifest and digest verification path.
+- Credentials are supplied through a secret provider and never persisted in the
+  desired-state JSON or normal logs.
+
+### 12.1 Signed runtime manifest
+
+The assignment binds three different values: `artifact_id` is the central
+logical identity, `manifest_digest` is the digest of the canonical signed
+manifest, and `engine_image_digest` is the immutable OCI image digest. The
+manifest's file digests cover the materialized model/runtime tree. No single
+ambiguous directory hash is used. The manifest contains:
+
+```json
+{
+  "manifest_version": 1,
+  "artifact_type": "model-runtime",
+  "artifact_id": "artifact_qwen25_05b",
+  "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "files": [
+    {"path": "config.json", "size_bytes": 123, "digest": "sha256:..."},
+    {"path": "model.safetensors", "size_bytes": 456, "digest": "sha256:..."}
+  ],
+  "total_size_bytes": 579,
+  "engine_image_digest": "sha256:image...",
+  "runtime_requirements": {"cuda_min": "12.1"},
+  "source_allowlist": ["https://mirror.example/models/"],
+  "signature": {"algorithm": "ed25519", "key_id": "release-2026-01", "value": "base64url..."}
+}
+```
+
+The signed `manifest_digest` covers canonical JSON with the signature field
+removed. The assignment's `engine_image_digest` MUST equal the manifest's image
+digest. The manifest's `artifact_id` and `revision` MUST equal the assignment
+values. The manifest digest is the sole authoritative content identity; an
+artifact name or revision without a matching manifest digest is not eligible for
+launch. The
+central plane publishes trusted signing key IDs; the node local policy pins
+acceptable key IDs and may reject a centrally authenticated but unsigned or
+incorrectly signed manifest. Model files, tokenizer files, adapters, plugins,
+and engine images are all included in the runtime manifest or referenced by
+their own signed manifests.
+
+The downloader MUST restrict redirects to approved hosts, reject path traversal,
+absolute paths, symlinks, hard links, archives with excessive expansion, and
+files exceeding manifest or local limits. It MUST set final ownership and
+permissions under the agent's artifact user. Garbage collection obtains a
+shared cache lock and cannot remove an artifact pinned by an assignment or an
+engine start transaction.
+
+Central owns artifact approval, manifest, revision, source policy, and registry
+credentials policy. The node owns transfer, local verification, caching, and
+materialization. The node may fetch only sources present in the approved
+manifest; it does not resolve mutable aliases.
+
+## 13. Engine Driver Interface
+
+Drivers translate a typed assignment to a safe local runtime. A driver should
+provide:
+
+```text
+validate(spec, inventory) -> validation result
+prepare(spec, artifact store) -> prepared artifact references
+launch(spec, prepared) -> owned process/container handle
+inspect(handle) -> observed process state
+probe(spec, handle) -> readiness result
+drain(spec, handle, deadline) -> drain result
+stop(handle, force_after) -> stop result
+collect_telemetry(handle) -> bounded observation
+```
+
+The generic driver supports a fixed executable/container image selected from
+local configuration. It does not accept a free-form command string from the
+control plane.
+
+Initial driver priorities:
+
+1. vLLM container or process driver.
+2. Generic OpenAI-compatible process driver.
+3. Ollama driver.
+4. SGLang driver.
+5. TensorRT-LLM driver after its lifecycle requirements are understood.
+
+Each driver declares:
+
+- Supported protocol and engine versions.
+- Required artifact formats.
+- Required GPU capabilities.
+- Allowed parameters and defaults.
+- Readiness endpoint and model identity check.
+- Graceful shutdown behavior.
+- Whether it supports hot reload or only replacement.
+
+## 14. Process and Container Supervision
+
+The supervisor must use ownership markers and bounded lifecycle behavior:
+
+- Dedicated working directory per engine assignment.
+- Dedicated log directory with rotation and size limits.
+- Environment allow-list; no arbitrary secret interpolation.
+- Explicit GPU device assignment.
+- Port reservation before launch.
+- Process group or container identity tracking.
+- Graceful signal sequence followed by a deadline and force termination.
+- Restart budget and exponential backoff.
+- Crash-loop quarantine.
+- Child-process cleanup without killing unrelated host processes.
+- Verification that a PID still belongs to the expected command/container before
+  sending a signal.
+
+The central plane may request `Running`, `Draining`, or `Stopped`; it may not
+send `kill`, `exec`, or shell snippets.
+
+### 14.1 First-release privilege profile
+
+On the managed Linux profile:
+
+- `meridian-node` runs as a dedicated non-root OS user.
+- The agent has read-only access to NVML/device inventory and no Docker socket.
+- A small root-owned helper, installed by the package, owns only the validated
+  Docker lifecycle operations and receives a local Unix-socket protocol with
+  typed requests. The socket is owned by root, mode `0660`, and accessible only
+  to the agent group. Every request contains `operation_id`, `agent_session_id`,
+  a nonce, and a typed payload. The helper accepts requests only with the
+  currently active server-issued `fencing_epoch` and session assertion; it
+  rejects replayed IDs and validates device, image, path, resource, and
+  local-policy constraints again. It does not
+  accept commands or arbitrary arguments.
+- Engines run as a separate restricted user inside a rootless or narrowly
+  delegated container runtime where GPU support permits.
+- Engine containers receive only selected GPU device nodes, a read-only
+  verified artifact mount, a private data directory, and the configured private
+  network.
+- No host root filesystem, agent state directory, SSH keys, or control-plane
+  client key is mounted into an engine.
+- cgroup CPU, memory, PID, file-size, and open-file limits are applied.
+- The helper requires an allow-listed image digest and driver version.
+
+The helper stores the highest accepted fencing epoch in its root-owned journal.
+The agent updates that record after session establishment and before local
+lifecycle mutations. A lower epoch is rejected even if its certificate remains
+cryptographically valid. If the helper cannot refresh its epoch record, it
+refuses lifecycle mutations.
+
+If the selected runtime cannot provide the required isolation, managed-host mode
+MUST refuse to start. Observe-only mode remains available.
+
+## 15. Security Model
+
+### 15.1 Trust boundaries
+
+The agent is privileged relative to the host and therefore must assume that the
+central API can be compromised independently from the host. mTLS protects
+transport identity and confidentiality; it does not protect against a fully
+compromised authorized control plane issuing harmful desired state. The local
+policy file, installed by the host operator and owned by root, is an independent
+constraint. It pins allowed engine image digests, artifact signing keys, source
+hosts, device classes, ports, mounts, resource ceilings, and whether managed
+mode is enabled. The agent MUST reject desired state outside this policy even
+when the request is correctly authenticated. A local `disable-management`
+switch MUST stop lifecycle mutations without deleting evidence or killing
+already-running engines.
+
+The central plane must treat agent reports as authenticated claims, not as
+proof. Endpoint verification and policy checks remain central responsibilities.
+
+### 15.2 Identity
+
+- Bootstrap uses a one-time enrollment token stored hashed at the server.
+- The agent creates or loads a node key locally.
+- Enrollment binds `node_id` to the public key and the initial agent session.
+- Subsequent communication uses mTLS with a node certificate.
+- Certificates use Ed25519 keys, bounded lifetime, SAN `node_id`, and automatic
+  rotation before half-life.
+- Revocation is published through a short-lived server-side deny list and checked
+  on every heartbeat; gateways reject observations from revoked node IDs.
+- A lost key requires operator revocation followed by a new one-time enrollment;
+  a node cannot silently generate a replacement identity.
+- The server authorizes the node only for its own resources.
+
+### 15.3 Least privilege
+
+Node credentials may:
+
+- renew the node lease;
+- publish inventory and observations;
+- fetch desired state for that node;
+- acknowledge assignment conditions.
+
+Node credentials may not:
+
+- read tenant API keys;
+- read arbitrary control-plane data;
+- create other nodes;
+- change placement policy;
+- modify desired state;
+- access application request content;
+- access other node credentials.
+
+### 15.4 Input validation
+
+The agent rejects:
+
+- unsupported engine kinds or versions;
+- unknown parameters;
+- paths outside controlled roots;
+- devices not present in local inventory;
+- memory claims that exceed policy;
+- ports outside configured ranges;
+- artifact digests that do not match the manifest;
+- images not in the local allow-list or signature policy;
+- environment variables not explicitly allowed;
+- assignments for another node.
+
+The central gateway validates that advertised endpoints are allowed network
+targets, do not create SSRF paths, and belong to the reporting node's approved
+address policy before proxying traffic.
+
+### 15.5 Logging
+
+Logs include node/engine IDs, generation, operation ID, phase, status, reason,
+latency, and error class. They exclude prompts, completions, bearer tokens,
+private keys, model credentials, and unrestricted environment values.
+
+## 16. Failure Semantics
+
+### 16.1 Control-plane outage
+
+The agent continues the last accepted desired state for the five-minute agent
+outage grace period. It does not accept a new assignment or extend beyond local
+safety limits. At grace expiry it enters `ControlPlaneUnknown`, marks all
+assignments non-adoptable, and begins draining them. Existing streams may finish
+until each assignment's drain deadline; new application traffic is already
+blocked by central lease expiry. If the control plane returns during drain, the
+agent may resume only after a fresh lease and desired generation are accepted;
+the central plane may either cancel the drain with an explicit generation or
+allow it to complete. The five-minute value is a bounded default and may be
+shortened by local policy, but cannot be extended beyond the server's lease and
+admission rules.
+
+### 16.2 Agent crash
+
+An engine may continue serving. Meridian expires the node lease after the
+configured TTL and withdraws the endpoint from new admissions. A restarted agent
+discovers and adopts only matching owned processes.
+
+### 16.3 Engine crash
+
+The agent reports `Failed`, applies bounded restart policy, and does not report
+`Ready` until the requested model and digest pass readiness. Meridian removes the
+endpoint from admission based on observed condition and its own endpoint checks.
+
+### 16.4 Model download failure
+
+The assignment remains `Pulling` or `Failed` with a typed reason. Partial files
+are retained only if safely resumable. No unverified file may be passed to an
+engine.
+
+### 16.5 GPU failure or thermal emergency
+
+The response depends on severity. A thermal emergency or fatal device error
+permits immediate stop because continued execution is unsafe. Degraded telemetry
+marks the device unavailable for new assignments and requests a drain. A
+recoverable driver error uses bounded restart policy. Unknown health fails closed
+for new admission while preserving existing work only when local safety policy
+allows it. Every transition reports the device condition and fences the device
+from future assignments until inventory verifies recovery.
+
+### 16.6 Network partition
+
+Lease expiry, not endpoint reachability from one gateway replica, is the final
+central safety signal for node disappearance. The gateway must distinguish a
+stale node observation from a healthy endpoint observed by a different network
+path.
+
+### 16.7 Stale messages
+
+Messages are accepted only when node ID, certificate identity, agent session ID,
+and sequence/generation rules match. An agent restart on the same host boot
+creates a new session and fences the previous process. Delayed messages from an
+old agent session can never resurrect a node or engine assignment.
+
+## 17. Central Meridian Integration Requirements
+
+The companion Meridian repository needs a control-plane implementation before
+managed-host mode is enabled. Required capabilities include:
+
+- durable node, GPU, artifact, assignment, lease, and observation records;
+- one-time enrollment and node certificate issuance;
+- node-scoped authorization;
+- heartbeat sequence and lease expiry handling;
+- desired-state generations and complete snapshots;
+- serving endpoint projection into the router;
+- endpoint admission and drain epochs;
+- explicit `Unknown`, `Draining`, and `Ready` conditions;
+- static YAML backend compatibility;
+- shared inventory synchronization across gateway replicas;
+- bounded Prometheus labels and redacted operator views;
+- audit events for enrollment, assignment, transitions, expiry, and revocation.
+
+The existing in-memory `BackendRegistry` must remain a routing projection, not
+the authoritative node inventory. Its dynamic provider should publish immutable
+snapshots keyed by stable engine IDs while retaining local inflight, EWMA,
+circuit, and endpoint-observation fields per gateway replica.
+
+### 17.1 Observation authority
+
+| Signal | Source | Use |
+|---|---|---|
+| `ProcessAlive` | Node observation | Diagnostic and reconciliation input. |
+| `ModelLoaded` and digest | Node observation plus manifest verification | Required claim, independently checked where possible. |
+| `ProtocolReady` | Node-local probe | Required claim, not sufficient for admission. |
+| `GatewayReachable` | Central/gateway probe | Required for admission. |
+| GPU capacity | Node observation with freshness TTL | Placement input, never a reservation guarantee. |
+| Node lease | Central accepted heartbeat | Authoritative admission gate. |
+| `Admitting` | Central control plane | Authoritative new-request gate. |
+| `Routable` | Central derived projection | Gateway routing input. |
+
+Node capacity observations expire after two heartbeat intervals. Stale capacity
+is `Unknown` and cannot justify new placement. Engine readiness and endpoint
+details expire after one heartbeat interval or five seconds, whichever is
+longer; stale readiness is not routable. Central placement approval is
+necessary but not sufficient: the node performs a transactional local admission
+against current devices, ports, disk, CPU, RAM, and GPU reservations. Rejection
+produces a typed `LocalAdmissionRejected` condition and central must reschedule
+or revise the assignment.
+
+### 17.2 Endpoint probe quorum and conflict precedence
+
+For the first private-network deployment, the control plane stores a durable
+required-replica membership snapshot for each admission epoch. Every gateway
+replica in that snapshot that can receive
+application traffic MUST probe the endpoint from its own network location. The
+serving projection includes the set of replica probe results and their revision.
+An endpoint is `GatewayReachable` only when all required replicas pass, or when
+an explicitly configured quorum policy says otherwise. Membership is frozen for
+the drain epoch; later replica joins do not block that drain, while a removed
+replica is recorded as withdrawn by the control-plane membership controller. A
+replica probe pass expires after 5 seconds. A replica with a stale
+projection or a failed local probe MUST fail closed and not route to that
+endpoint. Central admission is the final authority in a disagreement, and its
+projection atomically couples node lease, accepted agent session, engine
+observation revision, endpoint probe revision, and admission epoch.
+
+Precedence is: revoked credential or expired lease, then central drain/admission
+state, then central gateway probe, then node readiness claim, then informational
+telemetry. A lower revision can never restore `Routable`.
+
+### 17.3 Inventory providers and migration
+
+Every serving endpoint has a stable ID and provider: `static`, `observed`, or
+`managed`. Provider identity is part of the routing projection. Two providers
+claiming the same endpoint address or engine ID create a conflict and neither
+dynamic claim is admitted automatically. Migration from static to managed
+requires an explicit operator adoption operation that binds the stable endpoint
+to a node and generation. Endpoint similarity alone never transfers ownership.
+
+### 17.4 Local reservation transaction
+
+Before launch, the agent atomically reserves device IDs, a configured GPU-memory
+budget, host RAM, CPU quota, artifact disk space, and port. Observed free VRAM is
+only a placement hint. A reservation remains until process termination is
+confirmed. The node may reject a central assignment if current local state makes
+the reservation unsafe. MIG parent/child conflicts and multi-GPU assignments are
+validated as one transaction; partial reservations are rolled back.
+
+## 18. API and Version Compatibility
+
+Protocol versions are independent from agent and Meridian application versions.
+The server advertises supported protocol versions during enrollment. The agent
+selects one version and uses it for the lifetime of its agent session. A process
+restart on the same host creates a new session but does not change the selected
+protocol version unless compatibility negotiation requires re-enrollment.
+
+Compatibility rules:
+
+- Additive fields are allowed and must be safely ignored when marked optional.
+- Unknown enum values are not silently mapped to a safe state; the resource is
+  rejected with a typed compatibility condition.
+- Required field removal requires a new protocol version.
+- A desired-state generation is valid only under its protocol version.
+- The server must support at least one previous agent protocol during rollout.
+- The agent must refuse to apply a response signed for another node or session.
+
+The contract is maintained in this repository under `contracts/v1/` and mirrored
+as a versioned artifact in the central Meridian release. Runtime code is not
+shared through a Git submodule.
+
+## 19. Observability
+
+Required metrics have bounded labels:
+
+- `meridian_node_heartbeat_total{result}`
+- `meridian_node_lease_seconds{state}`
+- `meridian_node_reconcile_total{result}`
+- `meridian_node_assignment_info{engine_kind,phase}`
+- `meridian_node_assignment_restarts_total{engine_kind}`
+- `meridian_node_artifact_bytes_total{operation,result}`
+- `meridian_node_artifact_verification_total{result}`
+- `meridian_node_engine_ready_seconds{engine_kind}`
+- `meridian_node_gpu_memory_bytes{device_class,state}`
+
+Do not use raw node IDs, engine IDs, model aliases, request IDs, tenant IDs, or
+error messages as unbounded metric labels. Operator APIs may provide IDs in
+structured JSON with pagination and redaction.
+
+## 20. Testing Strategy
+
+### Contract tests
+
+- Schema validation for every request and response.
+- Golden enrollment, heartbeat, desired-state, and observation fixtures.
+- Unknown optional fields and unknown enum behavior.
+- Replay, stale session, lower generation, and duplicate sequence rejection.
+- Compatibility tests against the central Meridian control API.
+
+### Unit tests
+
+- State-machine transition legality.
+- Generation and sequence monotonicity.
+- Lease expiry and clock-skew handling.
+- Device assignment and resource validation.
+- Artifact staging, resumption, verification, promotion, and eviction.
+- Driver command construction from typed parameters.
+- Process identity and restart backoff.
+- Adoption and orphan handling.
+
+### Integration tests
+
+- Fake control plane with delayed, duplicated, and reordered messages.
+- Fake GPU inventory provider.
+- Fake artifact registry with interrupted downloads and bad digests.
+- Fake engine driver with crash loops and readiness delays.
+- Control-plane outage and recovery.
+- Agent restart while an engine is serving.
+- Drain with active streaming requests.
+- Two agents attempting conflicting ownership.
+- Crash injection at every operation-journal transition.
+- All gateway replicas converging on admission withdrawal.
+- Static and managed inventory conflict/adoption.
+- Control plane sending a validly authenticated assignment forbidden by local policy.
+
+### Host tests
+
+- NVIDIA host with one GPU.
+- NVIDIA host with multiple GPUs.
+- MIG fixture where available.
+- Insufficient VRAM, unavailable device, occupied port, and disk pressure.
+- systemd/container signal behavior.
+- No access to Docker socket unless the selected mode explicitly requires it.
+
+## 21. Phased Delivery
+
+### Phase 0: Contract and safety foundation
+
+- Repository skeleton and protocol schemas.
+- Agent configuration and local state store interface.
+- Enrollment/heartbeat client with fake control plane.
+- Inventory interfaces and fake NVIDIA provider.
+- No engine process control.
+
+**Exit criteria:** contract tests pass, replay/fencing tests pass, and the agent
+can enroll, heartbeat, persist state, and recover after restart. If the previous
+lease is still valid, a restarted agent waits for the active session to release
+a handoff or for the server to expire/fence it; it may not immediately replace
+the session. The test control plane must cover both handoff and lease-expiry
+recovery.
+
+### Phase 1: Read-only inventory
+
+- Real NVIDIA inventory provider.
+- Existing engine discovery for vLLM and Ollama.
+- Central read-only node and endpoint status.
+- Lease expiry withdraws endpoints from routing.
+
+**Exit criteria:** a node can be added without disrupting static backends, and a
+missed lease removes its endpoints from new admission across all gateway replicas.
+
+### Phase 2: One managed engine
+
+- vLLM driver only.
+- Pinned image and model digest.
+- Artifact cache and verification.
+- Start, readiness, drain, stop, and bounded restart.
+
+**Exit criteria:** crash recovery, bad digest rejection, clean drain, and no
+duplicate process after agent restart. This phase cannot begin until the
+managed-host gate includes production mTLS issuance, rotation, revocation,
+local policy enforcement, signed runtime manifests, and central admission
+withdrawal. Phase 4 adds deployment integrations and operational hardening; it is
+not the first point at which those controls exist.
+
+### Phase 3: Reconciliation and replacement
+
+- Multiple assignments per node.
+- Generation-based desired state.
+- Rolling replacement and rollback.
+- Operator reset from quarantine.
+
+**Exit criteria:** replacement causes no new-request failures after admission
+withdrawal, and stale agents cannot act on current assignments.
+
+### Phase 4: Engine and deployment expansion
+
+- Generic driver, Ollama, SGLang.
+- Kubernetes-native integration.
+- Air-gapped artifact bundles.
+- Certificate rotation and revocation automation hardening beyond the managed-host gate.
+
+**Exit criteria:** disconnected install, version-skew upgrade, node replacement,
+and at least two production deployment modes pass validation. Air-gapped mode is
+not part of the Phase 2 managed-host gate.
+
+### Phase 5: Placement and capacity
+
+- GPU/MIG placement constraints.
+- Artifact locality.
+- VRAM reservations.
+- Queue/capacity-aware assignment decisions.
+
+**Exit criteria:** assignments cannot overcommit declared resources and placement
+decisions remain explainable through operator status.
+
+## 22. Open Questions
+
+These questions should be answered before implementation leaves Phase 0:
+
+1. Should the central control API live inside the existing Meridian gateway
+   process initially, or be a separate control-plane service from the first
+   managed release?
+2. Is mTLS issued by Meridian, cert-manager, an enterprise PKI, or an external
+   identity service?
+3. What outage grace period is acceptable before an existing engine is drained?
+4. Is automatic enrollment allowed, or must an operator approve every node?
+5. Which model registries and artifact formats are in scope for the first
+   supported driver?
+6. Which GPU telemetry is required for placement versus merely displayed to
+   operators?
+7. Which certificate revocation mechanism best fits disconnected deployments?
+8. Should forced drain require per-operation operator approval in the first release?
+
+## 23. Initial Acceptance Checklist
+
+The first implementation is not complete until all of the following are true:
+
+- [ ] Empty or invalid configuration fails closed with an actionable error.
+- [ ] Enrollment tokens are one-use and expire.
+- [ ] Node certificates are bound to node identity and rotate.
+- [ ] Old agent sessions cannot update current state.
+- [ ] Heartbeats are idempotent and sequence-checked.
+- [ ] Desired generations never move backward.
+- [ ] A stale lease withdraws serving endpoints.
+- [ ] Static YAML backends continue to work unchanged.
+- [ ] No arbitrary remote shell or command execution exists.
+- [ ] No unverified model artifact can be launched.
+- [ ] Engine readiness verifies the requested model revision.
+- [ ] Unknown processes are not killed automatically.
+- [ ] Engine replacement drains before stopping the old instance.
+- [ ] Crash loops enter quarantine with a typed reason.
+- [ ] Control-plane outages have bounded, documented behavior.
+- [ ] Prometheus labels remain bounded.
+- [ ] Prompts and completions are never logged by the agent.
+- [ ] Air-gap mode can validate local artifacts without registry access. (Phase 4 gate.)
+- [ ] Contract tests run against a central Meridian test server.
+
+## 24. Immediate Next Steps
+
+1. Keep this RFC as the design baseline and resolve the open questions with a
+   design partner.
+2. Add `contracts/v1/` schemas and an OpenAPI document.
+3. Build a fake control-plane server used by agent contract tests.
+4. Implement local identity, durable state, heartbeat, and lease handling.
+5. Add a read-only NVIDIA inventory provider.
+6. Add a compatibility test target in the central Meridian repository.
+7. Do not add engine start/stop privileges until enrollment, fencing, and lease
+   expiry tests pass.
