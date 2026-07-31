@@ -1540,34 +1540,43 @@ enrollment approval are resolved as decisions 13–15 in Section 2.)
 
 ## 23. Initial Acceptance Checklist
 
-The first implementation is not complete until all of the following are true:
+The first implementation is not complete until all of the following are true.
+Boxes checked here are covered by the `meridian-node` implementation and its
+test suite; unchecked items depend on the central Meridian control plane or on
+later phases.
 
-- [ ] Empty or invalid configuration fails closed with an actionable error.
-- [ ] Enrollment tokens are one-use and expire.
-- [ ] Node certificates are bound to node identity and rotate.
-- [ ] Old agent sessions cannot update current state.
-- [ ] Heartbeats are idempotent and sequence-checked.
-- [ ] Desired generations never move backward.
-- [ ] A stale lease withdraws serving endpoints.
-- [ ] Static YAML backends continue to work unchanged.
-- [ ] No arbitrary remote shell or command execution exists.
-- [ ] No unverified model artifact can be launched.
-- [ ] Engine readiness verifies the requested model revision.
-- [ ] Unknown processes are not killed automatically.
-- [ ] Engine replacement drains before stopping the old instance.
-- [ ] Crash loops enter quarantine with a typed reason.
-- [ ] Control-plane outages have bounded, documented behavior.
-- [ ] Prometheus labels remain bounded.
-- [ ] Prompts and completions are never logged by the agent.
-- [ ] Enrollment approval gating is enforced by default; `auto_approve` is an
+- [x] Empty or invalid configuration fails closed with an actionable error.
+- [ ] Enrollment tokens are one-use and expire. *(agent-side single-use enforced
+      in the fake; server-side expiry is a central responsibility.)*
+- [ ] Node certificates are bound to node identity and rotate. *(central CA;
+      agent presents key and consumes the issued certificate.)*
+- [x] Old agent sessions cannot update current state.
+- [x] Heartbeats are idempotent and sequence-checked.
+- [x] Desired generations never move backward.
+- [ ] A stale lease withdraws serving endpoints. *(central gateway admission.)*
+- [ ] Static YAML backends continue to work unchanged. *(central Meridian.)*
+- [x] No arbitrary remote shell or command execution exists.
+- [x] No unverified model artifact can be launched.
+- [x] Engine readiness verifies the requested model revision.
+- [x] Unknown processes are not killed automatically.
+- [x] Engine replacement drains before stopping the old instance.
+- [x] Crash loops enter quarantine with a typed reason.
+- [x] Control-plane outages have bounded, documented behavior. *(retryable-error
+      backoff; grace-period draining is Phase 4 hardening.)*
+- [x] Prometheus labels remain bounded.
+- [x] Prompts and completions are never logged by the agent.
+- [x] Enrollment approval gating is enforced by default; `auto_approve` is an
       explicit per-token property.
-- [ ] Fencing epochs and desired generations cannot regress across a
-      control-plane restore from backup.
+- [x] Fencing epochs and desired generations cannot regress across a
+      control-plane restore from backup. *(generation floor enforced locally;
+      incarnation ordering is the central counterpart.)*
 - [ ] A full-fleet reconnect storm stays within server rate limits, tested by
-      restarting every agent simultaneously.
-- [ ] Agent upgrade does not restart healthy engines.
+      restarting every agent simultaneously. *(requires the central server.)*
+- [ ] Agent upgrade does not restart healthy engines. *(adoption implemented;
+      full host test pending.)*
 - [ ] Air-gap mode can validate local artifacts without registry access. (Phase 4 gate.)
-- [ ] Contract tests run against a central Meridian test server.
+- [ ] Contract tests run against a central Meridian test server. *(harness ready
+      in `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`.)*
 
 ## 24. Immediate Next Steps
 

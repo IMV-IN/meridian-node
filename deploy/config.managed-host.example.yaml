@@ -1,0 +1,29 @@
+# Managed-host agent. Lifecycle control is enabled ONLY when both mode is
+# managed-host AND policy.management_enabled is true. The policy block is the
+# local, root-owned safety constraint the agent enforces even against an
+# authenticated control plane (DESIGN.md 15.1). This file must be owned by root
+# and not writable by the agent user.
+control_plane_url: https://meridian-control.internal:8443
+mode: managed-host
+state_dir: /var/lib/meridian-node
+display_name: gpu-host-a
+heartbeat_interval_seconds: 10
+lease_ttl_seconds: 30
+
+policy:
+  management_enabled: true          # set false to disable lifecycle mutations (kill switch)
+  # Pinned engine image digests the helper may launch. Nothing else runs.
+  allowed_image_digests:
+    - "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  # Artifact signing keys this node trusts, key_id -> base64url Ed25519 public key.
+  trusted_signing_keys:
+    release-2026-01: "REPLACE_WITH_BASE64URL_PUBLIC_KEY"
+  # Hosts the downloader may fetch manifests and model files from.
+  allowed_source_hosts:
+    - mirror.example
+  port_range: [8000, 8100]
+  # GPU-memory budget the node will commit per device (bytes).
+  device_capacity_bytes:
+    "GPU-00000000-0000-0000-0000-000000000000": 8589934592
+  engine_host: 10.0.0.5              # private interface engines bind to
+  helper_socket_path: /run/meridian-node/helper.sock

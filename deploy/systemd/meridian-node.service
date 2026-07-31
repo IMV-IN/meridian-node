@@ -1,0 +1,32 @@
+[Unit]
+Description=Meridian node agent
+Documentation=https://github.com/IMV-IN/meridian-node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=meridian-node
+Group=meridian-node
+ExecStart=/opt/meridian-node/bin/meridian-node --config /etc/meridian-node/config.yaml run
+Restart=always
+RestartSec=5
+# Watchdog tied to the reconcile loop (DESIGN.md 14.2). The agent must call
+# sd_notify WATCHDOG=1 within this interval or systemd restarts it. A restart
+# never restarts healthy engines; they are re-adopted on startup.
+WatchdogSec=30
+# Resource ceilings so the agent can never contribute to host OOM pressure.
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=256
+# Hardening: the agent is non-root and needs no elevated capabilities. Docker
+# lifecycle is delegated to the separate root helper over its Unix socket.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/meridian-node
+StateDirectory=meridian-node
+
+[Install]
+WantedBy=multi-user.target
