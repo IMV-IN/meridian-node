@@ -36,12 +36,23 @@ First implementation of the node agent, built against `DESIGN.md`.
 - Deploy artifacts (systemd units, Dockerfile, example configs) and docs
   (INSTALL, SECURITY, ENGINE_DRIVERS).
 
+### Reference control plane
+- `refcontrol.ControlCore`: the authoritative in-memory server-side safety rules
+  (single-use tokens, epoch fencing, lease-expiry takeover, sequence
+  monotonicity), shared by the test fake and the dev server so there is one
+  implementation, not two.
+- `meridian-node-devserver`: a stdlib HTTP server exposing the v1 contract for
+  local dev and CI. Drives the real HttpTransport and managed loop end to end
+  (`tests/test_live_server.py`). Not the production control plane.
+- Enrollment now persists a pending claim and resumes it (across restart)
+  instead of re-spending a used token.
+
 ### Not yet included
-- Live central Meridian control plane wiring (compatibility harness in
+- Production central Meridian control plane wiring (compatibility harness in
   `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`).
 - Kubernetes-integrated and air-gapped modes (Phase 4).
 - Placement and capacity scheduling (Phase 5).
 - Certificate rotation/revocation automation and full host tests on GPU
   hardware.
 
-Tests: 66 passing; `ruff` and `mypy` clean.
+Tests: 69 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.

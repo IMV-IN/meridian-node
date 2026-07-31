@@ -69,26 +69,35 @@ class Agent:
 
     # --- enrollment -----------------------------------------------------
     def ensure_enrolled(self, poll_interval: float = 0.0, max_polls: int = 100) -> str:
-        """Enroll if no durable identity exists. Handles pending approval."""
+        """Enroll if no durable identity exists. Handles pending approval, and
+        resumes a persisted pending claim rather than re-spending a used token."""
         if self.node_id:
             return self.node_id
 
-        request = {
-            "agent_version": AGENT_VERSION,
-            "protocol_versions": [PROTOCOL_VERSION],
-            "node_public_key": self.identity.public_key_b64url(),
-            "host_claims": {"hostname": self.config.display_name or "", "platform": "linux"},
-            "host_boot_id": self.host_boot_id,
-            "agent_session_id": self.session_id,
-        }
-        resp = self.transport.enroll(request)
+        claim_id = self.state.pending_claim()
+        if claim_id is None:
+            request = {
+                "agent_version": AGENT_VERSION,
+                "protocol_versions": [PROTOCOL_VERSION],
+                "node_public_key": self.identity.public_key_b64url(),
+                "host_claims": {"hostname": self.config.display_name or "", "platform": "linux"},
+                "host_boot_id": self.host_boot_id,
+                "agent_session_id": self.session_id,
+            }
+            resp = self.transport.enroll(request)
+            if resp["status"] == "approved":
+                return self._accept_enrollment(resp)
+            claim_id = resp["claim_id"]
+            self.state.set_pending_claim(claim_id)
 
-        if resp["status"] == "pending":
-            resp = self._await_claim(resp["claim_id"], poll_interval, max_polls)
+        resp = self._await_claim(claim_id, poll_interval, max_polls)
+        return self._accept_enrollment(resp)
 
+    def _accept_enrollment(self, resp: dict) -> str:
         self.node_id = resp["node_id"]
         self.certificate = resp["certificate"]
         self.state.save_identity(self.node_id, self.certificate, _iso(self.now()))
+        self.state.clear_pending_claim()
         return self.node_id
 
     def _await_claim(self, claim_id: str, poll_interval: float, max_polls: int) -> dict:
@@ -97,6 +106,7 @@ class Agent:
             if resp["status"] == "approved":
                 return resp
             if resp["status"] == "denied":
+                self.state.clear_pending_claim()
                 raise ControlError("CLAIM_DENIED", "enrollment claim was denied")
             if poll_interval:
                 time.sleep(poll_interval)

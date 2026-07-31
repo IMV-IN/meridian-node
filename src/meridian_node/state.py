@@ -69,6 +69,18 @@ class StateStore:
         )
 
     # --- heartbeat sequence --------------------------------------------
+    def pending_claim(self) -> Optional[str]:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'pending_claim'").fetchone()
+        return row[0] if row else None
+
+    def set_pending_claim(self, claim_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('pending_claim', ?)", (claim_id,)
+        )
+
+    def clear_pending_claim(self) -> None:
+        self._conn.execute("DELETE FROM meta WHERE key = 'pending_claim'")
+
     def last_sequence(self) -> int:
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'last_sequence'").fetchone()
         return int(row[0]) if row else 0

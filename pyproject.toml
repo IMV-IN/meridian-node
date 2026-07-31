@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 meridian-node = "meridian_node.cli:main"
+meridian-node-devserver = "meridian_node.devserver:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/meridian_node"]

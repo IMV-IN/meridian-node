@@ -32,9 +32,15 @@ with adapter seams (fakes in tests) at the hardware and network boundaries
 | Root helper privilege boundary | Implemented + tested (protocol); Docker backend is host-tested |
 | Real mTLS HTTP transport, NVML provider, metrics | Implemented (HTTP mapping + NVML degrade tested) |
 
-Not yet wired: a live central Meridian control plane (see
-`tests/test_compat.py` for the compatibility target), Kubernetes-integrated and
-air-gapped modes (Phase 4), and placement/capacity (Phase 5).
+A runnable dev/reference control plane (`meridian-node-devserver`) implements
+the v1 wire protocol so the real HTTP transport and the managed loop can be
+driven end to end (`tests/test_live_server.py`). It is a development/CI tool,
+not the production `meridian-control` service (which belongs in the central
+Meridian repo, with Postgres and a real CA).
+
+Not yet wired: the production central Meridian control plane (compat target in
+`tests/test_compat.py`), Kubernetes-integrated and air-gapped modes (Phase 4),
+and placement/capacity (Phase 5).
 
 ## Quickstart
 
@@ -48,6 +54,17 @@ ruff check src tests && mypy src/meridian_node
 meridian-node --config deploy/config.observe-only.yaml check-config
 export MERIDIAN_NODE_TOKEN=<one-time-token>
 meridian-node --config deploy/config.observe-only.yaml run --once
+```
+
+Drive it against a local control plane end to end:
+
+```bash
+# Terminal 1: reference control plane (dev/CI only, not production)
+meridian-node-devserver --port 8443 --token dev-token:auto
+
+# Terminal 2: point the agent at it
+export MERIDIAN_NODE_TOKEN=dev-token
+meridian-node --config deploy/config.observe-only.yaml run --once   # control_plane_url: http://127.0.0.1:8443
 ```
 
 See [`docs/INSTALL.md`](docs/INSTALL.md), [`docs/SECURITY.md`](docs/SECURITY.md),
