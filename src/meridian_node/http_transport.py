@@ -23,7 +23,7 @@ _RETRYABLE_CODES = {"RATE_LIMITED", "CONTROL_UNAVAILABLE"}
 
 def _raise_for_envelope(resp: "httpx.Response") -> dict:
     if resp.status_code < 400:
-        return resp.json()
+        return dict(resp.json())
     try:
         err = resp.json().get("error", {})
     except Exception:

@@ -59,7 +59,7 @@ class NvmlProvider:
 
     def __init__(self):
         try:
-            import pynvml  # noqa: F401
+            import pynvml  # type: ignore[import-not-found]  # noqa: F401
         except ImportError as e:
             raise InventoryUnavailable("pynvml is not installed") from e
         self._pynvml = pynvml

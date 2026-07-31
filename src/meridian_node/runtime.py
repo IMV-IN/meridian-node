@@ -8,6 +8,7 @@ ownership-marker and lifecycle contract in memory.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -123,3 +124,71 @@ class FakeRuntime:
         )
         self._containers[runtime_id] = _FakeContainer(status=status)
         return runtime_id
+
+
+class HelperRuntime:
+    """Runtime that forwards typed requests to the root helper (DESIGN.md 14.1).
+
+    `send` is a callable taking a request dict and returning a response dict. In
+    production it writes to the helper's Unix socket; in tests it points straight
+    at HelperServer.handle. The agent never calls Docker directly.
+    """
+
+    def __init__(self, send, session_id: str, fencing_epoch: int):
+        self._send = send
+        self.session_id = session_id
+        self.fencing_epoch = fencing_epoch
+
+    def _request(self, op_id: str, req_type: str, payload: dict) -> dict:
+        resp = self._send({
+            "operation_id": op_id,
+            "agent_session_id": self.session_id,
+            "nonce": secrets.token_hex(16),
+            "fencing_epoch": self.fencing_epoch,
+            "type": req_type,
+            "payload": payload,
+        })
+        if not resp.get("ok"):
+            raise RuntimeError(f"helper rejected {req_type}: {resp}")
+        return dict(resp)
+
+    def launch(self, req: LaunchRequest) -> EngineHandle:
+        payload = {
+            "engine_id": req.engine_id,
+            "image_digest": req.image_digest,
+            "args": list(req.args),
+            "env": req.env,
+            "device_ids": list(req.device_ids),
+            "artifact_mount": req.artifact_mount,
+            "port": req.port,
+            "ownership_marker": req.ownership_marker,
+            "memory_limit_bytes": req.memory_limit_bytes,
+        }
+        op_id = f"launch:{req.ownership_marker}"
+        runtime_id = self._request(op_id, "launch", payload)["result"]
+        return EngineHandle(
+            engine_id=req.engine_id, runtime_id=runtime_id, image_digest=req.image_digest,
+            ownership_marker=req.ownership_marker, device_ids=req.device_ids, port=req.port,
+        )
+
+    def inspect(self, runtime_id: str) -> Optional[RuntimeStatus]:
+        result = self._request(f"inspect:{runtime_id}", "inspect", {"runtime_id": runtime_id})["result"]
+        return _status_from_dict(result) if result else None
+
+    def stop(self, runtime_id: str, force_after_seconds: int) -> None:
+        self._request(
+            f"stop:{runtime_id}", "stop",
+            {"runtime_id": runtime_id, "force_after_seconds": force_after_seconds},
+        )
+
+    def list_all(self) -> list[RuntimeStatus]:
+        results = self._request("list", "list", {})["result"] or []
+        return [_status_from_dict(r) for r in results]
+
+
+def _status_from_dict(d: dict) -> RuntimeStatus:
+    return RuntimeStatus(
+        runtime_id=d["runtime_id"], alive=d["alive"], image_digest=d["image_digest"],
+        ownership_marker=d["ownership_marker"], device_ids=tuple(d.get("device_ids", [])),
+        port=d.get("port", 0), exit_code=d.get("exit_code"),
+    )
