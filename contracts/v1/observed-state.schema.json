@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/observed-state.schema.json",
+  "title": "Node observed-state acknowledgement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["node_id", "agent_session_id", "sequence", "observed_generation"],
+  "properties": {
+    "node_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+    "agent_session_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "observed_generation": {"type": "integer", "minimum": 0},
+    "engines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["engine_id", "phase"],
+        "properties": {
+          "engine_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+          "phase": {
+            "type": "string",
+            "enum": ["Pending", "Pulling", "Starting", "Warming", "Ready", "Draining", "Stopped", "Failed", "Quarantined", "Orphaned"]
+          },
+          "restart_count": {"type": "integer", "minimum": 0},
+          "loaded_artifact_digest": {"$ref": "common.schema.json#/$defs/digest"},
+          "endpoint": {"type": "string", "maxLength": 512},
+          "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}}
+        }
+      }
+    },
+    "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}}
+  }
+}

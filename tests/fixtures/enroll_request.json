@@ -1,0 +1,8 @@
+{
+  "agent_version": "0.1.0",
+  "protocol_versions": ["v1"],
+  "node_public_key": "base64url-ed25519-public-key",
+  "host_claims": {"hostname": "gpu-host-a", "platform": "linux"},
+  "host_boot_id": "linux-boot-id-abc",
+  "agent_session_id": "session_01J000000000000000000000"
+}

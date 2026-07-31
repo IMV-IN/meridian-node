@@ -1,0 +1,8 @@
+{
+  "status": "approved",
+  "node_id": "node_01J000000000000000000000",
+  "certificate": "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----",
+  "trust_bundle": "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----",
+  "protocol_version": "v1",
+  "lease": {"heartbeat_interval_seconds": 10, "lease_ttl_seconds": 30}
+}

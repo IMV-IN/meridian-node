@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-node"
+version = "0.1.0"
+description = "Host-local agent for GPU inference servers managed by central Meridian"
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml",
+    "cryptography",
+]
+
+[project.optional-dependencies]
+# httpx is only needed once the real HTTP transport lands (Phase 0 tests use the
+# in-process fake control plane). Kept separate so the core install stays small.
+http = [
+    "httpx",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "jsonschema>=4.18",
+    "types-PyYAML",
+]
+
+[project.scripts]
+meridian-node = "meridian_node.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meridian_node"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/heartbeat.schema.json",
+  "title": "Node heartbeat request and response",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_boot_id", "agent_session_id", "fencing_epoch", "sequence", "sent_at", "agent"],
+      "properties": {
+        "host_boot_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "agent_session_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "fencing_epoch": {"type": "integer", "minimum": 0},
+        "sequence": {"type": "integer", "minimum": 0},
+        "sent_at": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "protocol", "mode"],
+          "properties": {
+            "version": {"type": "string", "maxLength": 64},
+            "protocol": {"$ref": "common.schema.json#/$defs/protocol_version"},
+            "mode": {"$ref": "common.schema.json#/$defs/mode"}
+          }
+        },
+        "inventory_digest": {"$ref": "common.schema.json#/$defs/digest"},
+        "gpus": {"type": "array"},
+        "artifacts": {"type": "array"},
+        "engines": {"type": "array"},
+        "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}}
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_time", "accepted_sequence", "fencing_epoch", "lease_expires_at", "desired_generation"],
+      "properties": {
+        "server_time": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "accepted_sequence": {"type": "integer", "minimum": 0},
+        "fencing_epoch": {"type": "integer", "minimum": 0},
+        "lease_expires_at": {"$ref": "common.schema.json#/$defs/timestamp"},
+        "desired_generation": {"type": "integer", "minimum": 0},
+        "admission_projection_revision": {"type": "integer", "minimum": 0},
+        "desired_state_ref": {"type": "string", "maxLength": 512}
+      }
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/common.schema.json",
+  "title": "Meridian node control protocol v1 — common definitions",
+  "$defs": {
+    "opaque_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 UTC timestamp"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "protocol_version": {
+      "type": "string",
+      "enum": ["v1"]
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["observe-only", "managed-host", "kubernetes-integrated", "air-gapped"]
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "observed_at"],
+      "properties": {
+        "type": {"type": "string", "maxLength": 128},
+        "status": {"type": "string", "enum": ["True", "False", "Unknown"]},
+        "reason": {"type": "string", "maxLength": 256},
+        "message": {"type": "string", "maxLength": 1024},
+        "observed_at": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "error_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable", "server_time"],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "INVALID_REQUEST", "UNSUPPORTED_SCHEMA",
+                "INVALID_CREDENTIAL", "NODE_NOT_AUTHORIZED",
+                "STALE_AGENT_SESSION", "LOWER_GENERATION", "CONFLICT",
+                "NODE_NOT_FOUND", "GENERATION_NOT_FOUND",
+                "RATE_LIMITED", "CONTROL_UNAVAILABLE",
+                "PENDING_APPROVAL", "CLAIM_DENIED"
+              ]
+            },
+            "message": {"type": "string", "maxLength": 1024},
+            "retryable": {"type": "boolean"},
+            "request_id": {"$ref": "#/$defs/opaque_id"},
+            "server_time": {"$ref": "#/$defs/timestamp"},
+            "retry_after_seconds": {"type": "number", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}
