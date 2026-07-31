@@ -1,0 +1,128 @@
+"""Unit tests for the engine-layer building blocks: state machine, drivers,
+reservation ledger, journal, and artifact trust chain."""
+
+from __future__ import annotations
+
+import pytest
+from engine_helpers import LocalFetcher, make_assignment, make_signed_manifest
+
+from meridian_node.artifacts import ArtifactStore, VerificationError, verify_manifest
+from meridian_node.drivers import DriverError, get_driver
+from meridian_node.journal import COMMITTED, Journal, JournalConflict
+from meridian_node.models import EnginePhase as P
+from meridian_node.reservation import ReservationError, ReservationLedger
+from meridian_node.statemachine import IllegalTransition, assert_transition, can_transition
+
+
+# --- state machine ------------------------------------------------------
+def test_legal_and_illegal_transitions():
+    assert can_transition(P.WARMING, P.READY)
+    assert can_transition(P.READY, P.DRAINING)
+    assert not can_transition(P.READY, P.PENDING)
+    with pytest.raises(IllegalTransition):
+        assert_transition(P.STOPPED, P.READY)
+
+
+# --- drivers ------------------------------------------------------------
+def test_vllm_build_launch_and_param_allowlist():
+    driver = get_driver("vllm")
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    gpus = [{"device_id": "GPU-fake-0"}]
+    driver.validate(a, gpus)
+    req = driver.build_launch(a, "/art/path", "node:engine:op")
+    assert "--model" in req.args and "/art/path" in req.args
+    assert req.ownership_marker == "node:engine:op"
+
+
+def test_vllm_rejects_unknown_parameter():
+    driver = get_driver("vllm")
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    a.parameters["danger"] = "rm -rf"
+    with pytest.raises(DriverError, match="unknown engine parameters"):
+        driver.validate(a, [{"device_id": "GPU-fake-0"}])
+
+
+def test_driver_rejects_missing_device():
+    driver = get_driver("vllm")
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    with pytest.raises(DriverError, match="device not present"):
+        driver.validate(a, [{"device_id": "some-other-gpu"}])
+
+
+# --- reservation --------------------------------------------------------
+def test_reservation_over_commit_and_port_conflict():
+    ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8100))
+    ledger.reserve("e1", ["g0"], 5 * 1024**3, 8000)
+    with pytest.raises(ReservationError, match="over-committed"):
+        ledger.reserve("e2", ["g0"], 5 * 1024**3, 8001)
+    with pytest.raises(ReservationError, match="already reserved"):
+        ledger.reserve("e3", ["g0"], 1 * 1024**3, 8000)
+    ledger.release("e1")
+    ledger.reserve("e2", ["g0"], 5 * 1024**3, 8001)  # now fits
+
+
+def test_reservation_port_range_enforced():
+    ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8100))
+    with pytest.raises(ReservationError, match="outside configured range"):
+        ledger.reserve("e1", ["g0"], 1, 9000)
+
+
+# --- journal ------------------------------------------------------------
+def test_journal_idempotent_and_digest_conflict(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    assert j.plan("op1", "sha256:aa", "e1", 1, "launch") == "planned"
+    # Same op + digest is a no-op returning the current state.
+    j.mark("op1", COMMITTED, result="rt-1")
+    assert j.plan("op1", "sha256:aa", "e1", 1, "launch") == COMMITTED
+    # Reused id with a different digest is rejected.
+    with pytest.raises(JournalConflict):
+        j.plan("op1", "sha256:bb", "e1", 1, "launch")
+    assert j.inspect("op1").result == "rt-1"
+
+
+# --- artifacts ----------------------------------------------------------
+def test_manifest_signature_and_digest_gate(tmp_path):
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"config.json": b"{}"})
+    verify_manifest(manifest, keys, digest)  # passes
+
+    with pytest.raises(VerificationError, match="digest mismatch"):
+        verify_manifest(manifest, keys, "sha256:" + "0" * 64)
+
+    tampered = {**manifest, "signature": {**manifest["signature"], "key_id": "unknown"}}
+    with pytest.raises(VerificationError, match="trust policy"):
+        verify_manifest(tampered, keys, digest)
+
+
+def test_artifact_materialize_verifies_and_promotes(tmp_path):
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"model.bin": b"weights"})
+    verified = verify_manifest(manifest, keys, digest)
+    store = ArtifactStore(tmp_path / "cache")
+    path = store.materialize(verified, digest, LocalFetcher(tmp_path / "src"), "local")
+    assert (path / "model.bin").read_bytes() == b"weights"
+    assert store.has(digest)
+    # Idempotent second call returns the same path without refetching.
+    assert store.materialize(verified, digest, LocalFetcher(tmp_path / "src"), "local") == path
+
+
+def test_artifact_rejects_corrupted_file(tmp_path):
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"model.bin": b"weights"})
+    verified = verify_manifest(manifest, keys, digest)
+    (tmp_path / "src" / "model.bin").write_bytes(b"tampered-different-length")
+    store = ArtifactStore(tmp_path / "cache")
+    with pytest.raises(VerificationError):
+        store.materialize(verified, digest, LocalFetcher(tmp_path / "src"), "local")
+    assert not store.has(digest)  # nothing promoted
+
+
+def test_artifact_lru_eviction_respects_pins(tmp_path):
+    m1, d1, k1, _ = make_signed_manifest(tmp_path / "s1", {"a.bin": b"x" * 1000}, artifact_id="a1")
+    m2, d2, k2, _ = make_signed_manifest(tmp_path / "s2", {"b.bin": b"y" * 1000}, artifact_id="a2")
+    store = ArtifactStore(tmp_path / "cache", max_bytes=1500)
+    store.materialize(verify_manifest(m1, k1, d1), d1, LocalFetcher(tmp_path / "s1"), "local")
+    store.pin(d1)
+    # Second artifact needs space; pinned d1 cannot be evicted, so this fails closed.
+    with pytest.raises(Exception):
+        store.materialize(verify_manifest(m2, k2, d2), d2, LocalFetcher(tmp_path / "s2"), "local")
+    store.unpin(d1)
+    store.materialize(verify_manifest(m2, k2, d2), d2, LocalFetcher(tmp_path / "s2"), "local")
+    assert store.has(d2) and not store.has(d1)  # d1 evicted once unpinned

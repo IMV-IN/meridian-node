@@ -37,3 +37,11 @@ class Transport(Protocol):
     def heartbeat(self, node_id: str, request: dict) -> dict:
         """POST /control/v1/nodes/{node_id}/heartbeat."""
         ...
+
+    def fetch_desired_state(self, node_id: str, generation: int) -> dict:
+        """GET /control/v1/nodes/{node_id}/desired-state. Complete snapshot."""
+        ...
+
+    def post_observation(self, node_id: str, observation: dict) -> dict:
+        """POST /control/v1/nodes/{node_id}/observations."""
+        ...

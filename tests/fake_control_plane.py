@@ -75,6 +75,9 @@ class FakeControlPlane:
         self.nodes: dict[str, NodeRecord] = {}
         self.claims: dict[str, Claim] = {}
         self._enroll_token: Optional[str] = None  # set by tests via with_token()
+        self.desired: dict[str, dict] = {}  # node_id -> snapshot dict
+        self.stop_authorized: dict[str, set] = {}  # node_id -> engine_ids cleared to stop
+        self.observations: dict[str, dict] = {}  # node_id -> latest observation
 
     # Tests select which token the next enroll() call presents.
     def presenting(self, token: str) -> "FakeControlPlane":
@@ -177,4 +180,25 @@ class FakeControlPlane:
             "lease_expires_at": _iso(node.lease_expires_at),
             "desired_generation": node.desired_generation,
             "admission_projection_revision": 0,
+            "stop_authorized_engine_ids": sorted(self.stop_authorized.get(node_id, set())),
         }
+
+    # --- desired state / observations ----------------------------------
+    def set_desired(self, node_id: str, snapshot: dict) -> None:
+        """Operator/placement action: publish a desired snapshot for a node."""
+        self.desired[node_id] = snapshot
+        self.nodes[node_id].desired_generation = snapshot["generation"]
+
+    def fetch_desired_state(self, node_id: str, generation: int) -> dict:
+        if node_id not in self.nodes:
+            raise ControlError("NODE_NOT_FOUND", "unknown node")
+        snap = self.desired.get(node_id)
+        if snap is None:
+            raise ControlError("GENERATION_NOT_FOUND", "no desired state published")
+        return snap
+
+    def post_observation(self, node_id: str, observation: dict) -> dict:
+        if node_id not in self.nodes:
+            raise ControlError("NODE_NOT_FOUND", "unknown node")
+        self.observations[node_id] = observation
+        return {"received": True}

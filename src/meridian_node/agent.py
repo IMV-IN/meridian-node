@@ -62,6 +62,11 @@ class Agent:
         self.node_id: Optional[str] = row[0] if row else None
         self.certificate: Optional[str] = row[1] if row else None
 
+        # Reconciler is attached only in managed-host mode (Phase 2+). Observe-only
+        # agents never construct one, so they cannot start or stop engines.
+        self.reconciler = None
+        self._cached_snapshot: Optional[dict] = None
+
     # --- enrollment -----------------------------------------------------
     def ensure_enrolled(self, poll_interval: float = 0.0, max_polls: int = 100) -> str:
         """Enroll if no durable identity exists. Handles pending approval."""
@@ -131,8 +136,40 @@ class Agent:
         resp = self.transport.heartbeat(self.node_id, request)
         # Persist only after the server accepts and durably commits the sequence.
         self.state.set_last_sequence(sequence)
-        self.state.set_accepted_generation(resp["desired_generation"])
+        if self.reconciler is None:
+            # Observe-only: the heartbeat is the only place generation is tracked.
+            self.state.set_accepted_generation(resp["desired_generation"])
         self.lease_expires_at = resp["lease_expires_at"]
+        return resp
+
+    def attach_reconciler(self, reconciler) -> None:
+        """Enable managed-host reconciliation. Refused unless mode allows it."""
+        if self.config.mode != "managed-host":
+            raise ValueError(f"reconciler requires managed-host mode, not {self.config.mode!r}")
+        self.reconciler = reconciler
+
+    def tick(self) -> dict:
+        """One managed-host cycle: heartbeat, fetch desired state if the
+        generation advanced, reconcile, and report observations (DESIGN.md 11)."""
+        resp = self.heartbeat_once()
+        if self.reconciler is None:
+            return resp
+
+        from .models import DesiredSnapshot
+
+        desired_generation = resp["desired_generation"]
+        if desired_generation > 0 and (
+            self._cached_snapshot is None or desired_generation > self._cached_snapshot["generation"]
+        ):
+            self._cached_snapshot = self.transport.fetch_desired_state(self.node_id, desired_generation)
+
+        if self._cached_snapshot is not None:
+            snapshot = DesiredSnapshot(**self._cached_snapshot)
+            stop_authorized = set(resp.get("stop_authorized_engine_ids", []))
+            observation = self.reconciler.apply(snapshot, stop_authorized=stop_authorized)
+            observation["agent_session_id"] = self.session_id
+            observation["sequence"] = self.state.last_sequence()
+            self.transport.post_observation(self.node_id, observation)
         return resp
 
     def close(self) -> None:
