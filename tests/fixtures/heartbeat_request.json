@@ -1,0 +1,13 @@
+{
+  "host_boot_id": "linux-boot-id-abc",
+  "agent_session_id": "session_01J000000000000000000000",
+  "fencing_epoch": 7,
+  "sequence": 1842,
+  "sent_at": "2026-07-31T12:00:00Z",
+  "agent": {"version": "0.1.0", "protocol": "v1", "mode": "managed-host"},
+  "inventory_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "gpus": [],
+  "artifacts": [],
+  "engines": [],
+  "conditions": []
+}

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/enrollment.schema.json",
+  "title": "Node enrollment request and response",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_version", "protocol_versions", "node_public_key", "host_boot_id", "agent_session_id"],
+      "properties": {
+        "agent_version": {"type": "string", "maxLength": 64},
+        "protocol_versions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "common.schema.json#/$defs/protocol_version"}
+        },
+        "node_public_key": {"type": "string", "description": "base64url Ed25519 public key"},
+        "csr": {"type": "string", "description": "base64url certificate signing request"},
+        "host_claims": {
+          "type": "object",
+          "properties": {
+            "hostname": {"type": "string", "maxLength": 253},
+            "platform": {"type": "string", "maxLength": 64}
+          }
+        },
+        "host_boot_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "agent_session_id": {"$ref": "common.schema.json#/$defs/opaque_id"}
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["approved", "pending"]},
+        "claim_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "node_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "certificate": {"type": "string", "description": "PEM node certificate"},
+        "trust_bundle": {"type": "string", "description": "PEM CA trust bundle"},
+        "protocol_version": {"$ref": "common.schema.json#/$defs/protocol_version"},
+        "lease": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["heartbeat_interval_seconds", "lease_ttl_seconds"],
+          "properties": {
+            "heartbeat_interval_seconds": {"type": "integer", "minimum": 1},
+            "lease_ttl_seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "approved"}}},
+          "then": {"required": ["node_id", "certificate", "trust_bundle", "protocol_version", "lease"]}
+        },
+        {
+          "if": {"properties": {"status": {"const": "pending"}}},
+          "then": {"required": ["claim_id"]}
+        }
+      ]
+    }
+  }
+}

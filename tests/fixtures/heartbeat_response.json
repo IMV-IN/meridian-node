@@ -1,0 +1,8 @@
+{
+  "server_time": "2026-07-31T12:00:00Z",
+  "accepted_sequence": 1842,
+  "fencing_epoch": 7,
+  "lease_expires_at": "2026-07-31T12:00:30Z",
+  "desired_generation": 42,
+  "admission_projection_revision": 128
+}

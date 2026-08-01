@@ -1,0 +1,22 @@
+[Unit]
+Description=Meridian node root helper (Docker lifecycle boundary)
+Documentation=https://github.com/IMV-IN/meridian-node
+After=docker.service
+Requires=docker.service
+
+[Service]
+# Root-owned: this is the only component permitted to run Docker lifecycle
+# operations (DESIGN.md 14.1). It accepts typed requests over a 0660 Unix socket
+# owned by root and the meridian-node group; it never accepts free-form commands.
+Type=simple
+User=root
+Group=meridian-node
+RuntimeDirectory=meridian-node
+RuntimeDirectoryMode=0750
+ExecStart=/opt/meridian-node/bin/meridian-node --config /etc/meridian-node/config.yaml helper
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

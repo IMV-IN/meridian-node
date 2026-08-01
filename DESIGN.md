@@ -8,7 +8,7 @@
 
 **Authors:** IMV-IN
 
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-01
 
 ### Normative language
 
@@ -74,6 +74,19 @@ This RFC makes the following decisions:
     environments earlier, but their process lifecycle is not managed.
 12. Production managed-host mode is blocked until mTLS enrollment, credential
     rotation, revocation, lease fencing, and artifact verification are enabled.
+13. The node control-plane API is `meridian-control`, a separate service and
+    deployable in the central Meridian repository and release train. The
+    data-plane gateway consumes its serving projection read-only.
+14. Node certificates are issued by a built-in minimal CA inside
+    `meridian-control`, behind a pluggable signer interface so cert-manager or
+    an enterprise PKI can replace it without protocol changes.
+15. Enrollment is approval-gated by default: a valid bootstrap token creates a
+    pending claim that an operator must approve before a certificate is issued.
+    Tokens may carry an explicit `auto_approve` flag for trusted provisioning
+    pipelines.
+16. The v1 protocol is engineered for a 100-node fleet and validated with
+    headroom to 500 nodes. Batched observation writes and streaming transports
+    are deferred until a fleet exceeds that envelope.
 
 ## 3. Goals and Non-Goals
 
@@ -258,6 +271,7 @@ choices, the first managed release has this concrete profile:
 | Engine runtime | Docker Engine through a narrowly configured runtime adapter |
 | Engine | vLLM, one pinned image digest |
 | Central database | PostgreSQL |
+| Control-plane service | `meridian-control`, a separate deployable in the central Meridian repository |
 | Control transport | HTTPS with mandatory node mTLS after enrollment |
 | Application transport | Meridian connects directly to a private engine address |
 | Artifact source | Approved HTTPS/Hugging Face mirror plus signed manifest |
@@ -355,7 +369,8 @@ operating system. `agent_session_id` changes on every agent process start and
 fences delayed messages from a prior process.
 
 The server stores one active session and a monotonically increasing
-`fencing_epoch` per node. Possession of the durable node key is necessary but is
+`fencing_epoch` per node, ordered under the control-plane incarnation defined
+in Section 17.5 so that a database restore cannot regress fencing decisions. Possession of the durable node key is necessary but is
 not sufficient to replace a live session. A new session is established only
 when the previous lease has expired, the active session releases a single-use
 handoff token, or an operator explicitly fences the old session. Establishment
@@ -471,7 +486,10 @@ requested model.
 ```mermaid
 stateDiagram-v2
     [*] --> Enrolling
-    Enrolling --> Connected : enrollment accepted
+    Enrolling --> PendingApproval : token accepted, approval required
+    PendingApproval --> Connected : operator approved, certificate issued
+    PendingApproval --> [*] : claim denied or expired
+    Enrolling --> Connected : auto-approved token
     Connected --> Connected : heartbeat renewed
     Connected --> Unknown : lease expired
     Unknown --> Connected : session re-established after lease expiry
@@ -589,6 +607,16 @@ lease parameters, and the accepted protocol version. The server must reject a
 replayed token, a session ID already used by another active certificate, or a
 protocol with no compatible version. Re-enrollment after key loss requires
 operator revocation of the old certificate.
+
+Enrollment is approval-gated by default. A valid token creates a durable
+pending node claim and returns `202` with a `claim_id`; the certificate is
+issued only after an operator approves the claim. The agent polls
+`GET /control/v1/enroll/claims/{claim_id}`, proving possession of the node key
+by signing a server-provided nonce, with bounded backoff until the claim is
+approved, denied, or expired. A denied or expired claim terminates enrollment
+and requires a new token. Tokens minted with `auto_approve` — intended for
+trusted provisioning pipelines — skip the pending state and receive the
+certificate in the initial response.
 
 ### 10.2 Heartbeat
 
@@ -738,6 +766,33 @@ The gateway must expose drain progress and projection revision. This is a
 cross-repository contract and requires an implementation change in central
 Meridian before managed replacement is enabled.
 
+### 10.7 Transport requirements and scale envelope
+
+Transport requirements:
+
+- The agent needs only outbound HTTPS (default 443). Standard HTTP CONNECT
+  proxies are supported through the usual proxy environment variables; the
+  mTLS session terminates at the control plane, never at a middlebox. TLS 1.3
+  is preferred, TLS 1.2 the minimum.
+- Reconnection uses full-jitter exponential backoff (1-second base, 60-second
+  cap), and heartbeat schedules are phase-spread per node, so a control-plane
+  restart with the entire fleet reconnecting produces bounded load. The server
+  additionally rate-limits per node and answers `429` with `Retry-After`.
+
+The v1 protocol is engineered for 100 nodes and validated with headroom to
+500. Inside that envelope the load budget is deliberately boring:
+
+| Load source | At 100 nodes | Consequence |
+|---|---|---|
+| Heartbeats (10 s interval) | ~10 commits/s | Each committed individually and durably; no batching needed. |
+| Long-poll connections | ≤ node count | One open request per node at most. |
+| Desired-state fetches | Rare (generation changes only) | Content-addressed snapshots are cacheable. |
+| Observation writes | Bounded by heartbeat rate | Deduplicated by `(node_id, agent_session_id, sequence)`. |
+
+Beyond ~500 nodes, batched observation writes, projection partitioning, and a
+persistent streaming transport become necessary. Those are explicitly out of
+scope for protocol v1 and require a protocol revision, not incremental flags.
+
 ## 11. Reconciliation Algorithm
 
 The agent uses a durable local state store. Its main loop is:
@@ -783,7 +838,7 @@ Reconciliation must be idempotent:
   agent session.
 - A failed operation must leave a condition explaining whether retry is safe.
 
-### 11.3 Operation journal
+### 11.1 Operation journal
 
 The first release uses SQLite in WAL mode on the local state volume. The agent
 MUST fsync committed journal rows before acknowledging a side effect that cannot
@@ -821,14 +876,14 @@ completed the requested local operation; `observed` means a subsequent probe
 confirmed the result. Heartbeats acknowledge only `persisted` observations and
 return the latest `observed` conditions.
 
-### 11.1 Local operation locking
+### 11.2 Local operation locking
 
 Operations that affect one GPU allocation are serialized. The local store holds
  an ownership record containing `node_id`, `agent_session_id`, `engine_id`, generation,
 operation ID, start time, and expiry. An expired operation can be recovered only
 after re-checking process identity and filesystem state.
 
-### 11.2 Crash recovery
+### 11.3 Crash recovery
 
 On restart, the agent must:
 
@@ -1012,6 +1067,23 @@ refuses lifecycle mutations.
 If the selected runtime cannot provide the required isolation, managed-host mode
 MUST refuse to start. Observe-only mode remains available.
 
+### 14.2 Agent self-health
+
+The agent is itself a supervised process and must not become the least
+reliable component on the host:
+
+- The systemd unit uses `Restart=always` plus `WatchdogSec` with `sd_notify`
+  keepalives tied to the main reconcile loop, so a wedged loop is restarted.
+  An agent restart never restarts healthy engines; they are re-adopted through
+  normal crash recovery.
+- The agent unit carries `MemoryMax`, `CPUQuota`, and `TasksMax` limits. The
+  agent must never contribute to host OOM pressure; exceeding its own memory
+  bound is a restart, not an engine outage.
+- The agent refuses lifecycle mutations when the state volume exceeds a
+  configured usage threshold, reporting `StateStoreUnavailable` before SQLite
+  writes can fail mid-operation.
+- Agent logs rotate under the same size and retention limits as engine logs.
+
 ## 15. Security Model
 
 ### 15.1 Trust boundaries
@@ -1044,6 +1116,17 @@ proof. Endpoint verification and policy checks remain central responsibilities.
 - A lost key requires operator revocation followed by a new one-time enrollment;
   a node cannot silently generate a replacement identity.
 - The server authorizes the node only for its own resources.
+
+The first release issues node certificates from a built-in minimal CA inside
+`meridian-control`: an Ed25519 issuing key, a node-certificate profile only,
+and key material stored with root-only permissions (KMS/HSM-backed storage
+optional). Trust-bundle rotation is overlap-based: heartbeat responses deliver
+a bundle containing both old and new roots before issuance switches, and the
+old root is removed only after every active node holds the new bundle.
+Issuance sits behind a signer interface so cert-manager or an enterprise PKI
+can replace the built-in CA without protocol changes. CA-compromise recovery
+(revoke-all plus fleet re-enrollment with fresh tokens) MUST be a documented
+runbook procedure before managed-host GA.
 
 ### 15.3 Least privilege
 
@@ -1231,6 +1314,30 @@ confirmed. The node may reject a central assignment if current local state makes
 the reservation unsafe. MIG parent/child conflicts and multi-GPU assignments are
 validated as one transaction; partial reservations are rolled back.
 
+### 17.5 Control-plane deployment, HA, and restore
+
+`meridian-control` runs as its own process with its own deployment and scaling,
+in the central Meridian repository and release train. Gateways consume the
+serving projection read-only; the data plane never writes control state.
+Control replicas are stateless — PostgreSQL is the single source of truth —
+so active-passive control replicas are sufficient inside the v1 scale
+envelope.
+
+Restore-from-backup is a fencing event, not a transparent recovery:
+
+- The control plane persists a **control-plane incarnation** that MUST
+  increment on any restore from backup. Session fencing compares
+  `(incarnation, fencing_epoch)`, so an epoch value that regressed in restored
+  data can never re-admit a previously fenced agent.
+- On restore, all leases are expired, all sessions must re-establish, and all
+  endpoints are non-routable until fresh heartbeats and gateway probes arrive.
+- Desired-state generations MUST NOT regress across restore. The agent's
+  durable accepted generation is the floor: a lower generation from a restored
+  control plane produces a typed `GenerationRegression` condition and no
+  reconciliation occurs until an operator republishes desired state at a
+  higher generation. The restore runbook advances all generation counters past
+  a recorded high-water mark before the control plane serves agents again.
+
 ## 18. API and Version Compatibility
 
 Protocol versions are independent from agent and Meridian application versions.
@@ -1253,6 +1360,22 @@ The contract is maintained in this repository under `contracts/v1/` and mirrored
 as a versioned artifact in the central Meridian release. Runtime code is not
 shared through a Git submodule.
 
+### 18.1 Agent release and fleet rollout
+
+- The agent ships as a signed OS package with a matching pinned container
+  image. Releases publish checksums and signatures; hosts verify before
+  install.
+- The agent never self-updates. Host configuration management owns upgrades;
+  an upgrade replaces only the agent process and re-adopts running engines
+  through the normal crash-recovery path.
+- Fleet rollouts are ringed: upgrade a canary subset (at most 10% of nodes)
+  and watch lease flaps, reconcile errors, and readiness regressions before
+  widening.
+- The server advertises minimum and maximum supported agent versions. An
+  out-of-range agent receives a typed `AgentVersionUnsupported` condition,
+  keeps its lease, is restricted to observe-only behavior for lifecycle
+  changes, and is flagged to operators.
+
 ## 19. Observability
 
 Required metrics have bounded labels:
@@ -1270,6 +1393,19 @@ Required metrics have bounded labels:
 Do not use raw node IDs, engine IDs, model aliases, request IDs, tenant IDs, or
 error messages as unbounded metric labels. Operator APIs may provide IDs in
 structured JSON with pagination and redaction.
+
+### 19.1 Service-level objectives
+
+These SLOs gate managed-host GA and pause fleet rollout rings when violated.
+They are computed from the metrics above via recording rules:
+
+| SLO | Target |
+|---|---|
+| Node lease uptime, excluding host/network outages | 99.9% monthly |
+| Server heartbeat handling latency | p99 < 250 ms |
+| Enrollment approval to first accepted heartbeat | < 60 s |
+| Assignment accepted to `Ready`, artifact already cached | < 5 min |
+| Drains completing without forced stop | > 99% |
 
 ## 20. Testing Strategy
 
@@ -1390,45 +1526,57 @@ decisions remain explainable through operator status.
 
 ## 22. Open Questions
 
-These questions should be answered before implementation leaves Phase 0:
+These questions should be answered before implementation leaves Phase 0.
+(Former questions on control-plane placement, certificate issuance, and
+enrollment approval are resolved as decisions 13–15 in Section 2.)
 
-1. Should the central control API live inside the existing Meridian gateway
-   process initially, or be a separate control-plane service from the first
-   managed release?
-2. Is mTLS issued by Meridian, cert-manager, an enterprise PKI, or an external
-   identity service?
-3. What outage grace period is acceptable before an existing engine is drained?
-4. Is automatic enrollment allowed, or must an operator approve every node?
-5. Which model registries and artifact formats are in scope for the first
+1. What outage grace period is acceptable before an existing engine is drained?
+2. Which model registries and artifact formats are in scope for the first
    supported driver?
-6. Which GPU telemetry is required for placement versus merely displayed to
+3. Which GPU telemetry is required for placement versus merely displayed to
    operators?
-7. Which certificate revocation mechanism best fits disconnected deployments?
-8. Should forced drain require per-operation operator approval in the first release?
+4. Which certificate revocation mechanism best fits disconnected deployments?
+5. Should forced drain require per-operation operator approval in the first release?
 
 ## 23. Initial Acceptance Checklist
 
-The first implementation is not complete until all of the following are true:
+The first implementation is not complete until all of the following are true.
+Boxes checked here are covered by the `meridian-node` implementation and its
+test suite; unchecked items depend on the central Meridian control plane or on
+later phases.
 
-- [ ] Empty or invalid configuration fails closed with an actionable error.
-- [ ] Enrollment tokens are one-use and expire.
-- [ ] Node certificates are bound to node identity and rotate.
-- [ ] Old agent sessions cannot update current state.
-- [ ] Heartbeats are idempotent and sequence-checked.
-- [ ] Desired generations never move backward.
-- [ ] A stale lease withdraws serving endpoints.
-- [ ] Static YAML backends continue to work unchanged.
-- [ ] No arbitrary remote shell or command execution exists.
-- [ ] No unverified model artifact can be launched.
-- [ ] Engine readiness verifies the requested model revision.
-- [ ] Unknown processes are not killed automatically.
-- [ ] Engine replacement drains before stopping the old instance.
-- [ ] Crash loops enter quarantine with a typed reason.
-- [ ] Control-plane outages have bounded, documented behavior.
-- [ ] Prometheus labels remain bounded.
-- [ ] Prompts and completions are never logged by the agent.
+- [x] Empty or invalid configuration fails closed with an actionable error.
+- [ ] Enrollment tokens are one-use and expire. *(agent-side single-use enforced
+      in the fake; server-side expiry is a central responsibility.)*
+- [ ] Node certificates are bound to node identity and rotate. *(central CA;
+      agent presents key and consumes the issued certificate.)*
+- [x] Old agent sessions cannot update current state.
+- [x] Heartbeats are idempotent and sequence-checked.
+- [x] Desired generations never move backward.
+- [ ] A stale lease withdraws serving endpoints. *(central gateway admission.)*
+- [ ] Static YAML backends continue to work unchanged. *(central Meridian.)*
+- [x] No arbitrary remote shell or command execution exists.
+- [x] No unverified model artifact can be launched.
+- [x] Engine readiness verifies the requested model revision.
+- [x] Unknown processes are not killed automatically.
+- [x] Engine replacement drains before stopping the old instance.
+- [x] Crash loops enter quarantine with a typed reason.
+- [x] Control-plane outages have bounded, documented behavior. *(retryable-error
+      backoff; grace-period draining is Phase 4 hardening.)*
+- [x] Prometheus labels remain bounded.
+- [x] Prompts and completions are never logged by the agent.
+- [x] Enrollment approval gating is enforced by default; `auto_approve` is an
+      explicit per-token property.
+- [x] Fencing epochs and desired generations cannot regress across a
+      control-plane restore from backup. *(generation floor enforced locally;
+      incarnation ordering is the central counterpart.)*
+- [ ] A full-fleet reconnect storm stays within server rate limits, tested by
+      restarting every agent simultaneously. *(requires the central server.)*
+- [ ] Agent upgrade does not restart healthy engines. *(adoption implemented;
+      full host test pending.)*
 - [ ] Air-gap mode can validate local artifacts without registry access. (Phase 4 gate.)
-- [ ] Contract tests run against a central Meridian test server.
+- [ ] Contract tests run against a central Meridian test server. *(harness ready
+      in `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`.)*
 
 ## 24. Immediate Next Steps
 

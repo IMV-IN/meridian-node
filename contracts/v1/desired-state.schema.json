@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/desired-state.schema.json",
+  "title": "Desired-state snapshot for one node",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["node_id", "generation", "snapshot_hash", "assignments"],
+  "properties": {
+    "node_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+    "generation": {"type": "integer", "minimum": 0},
+    "snapshot_hash": {"$ref": "common.schema.json#/$defs/digest"},
+    "assignments": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/assignment"}
+    }
+  },
+  "$defs": {
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_id", "node_id", "generation", "desired_phase", "engine", "artifact", "resources"],
+      "properties": {
+        "engine_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "node_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "generation": {"type": "integer", "minimum": 0},
+        "spec_revision": {"type": "integer", "minimum": 0},
+        "desired_phase": {"type": "string", "enum": ["Running", "Draining", "Stopped"]},
+        "engine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "image_digest"],
+          "properties": {
+            "kind": {"type": "string", "enum": ["vllm", "sglang", "ollama", "openai-generic"]},
+            "image_digest": {"$ref": "common.schema.json#/$defs/digest"},
+            "version": {"type": "string", "maxLength": 64}
+          }
+        },
+        "artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["artifact_id", "revision", "manifest_digest", "engine_image_digest"],
+          "properties": {
+            "artifact_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+            "revision": {"type": "string", "maxLength": 128},
+            "manifest_digest": {"$ref": "common.schema.json#/$defs/digest"},
+            "engine_image_digest": {"$ref": "common.schema.json#/$defs/digest"}
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["device_ids", "port"],
+          "properties": {
+            "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
+            "memory_limit_bytes": {"type": "integer", "minimum": 0},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        },
+        "parameters": {"type": "object"},
+        "policy": {
+          "type": "object",
+          "properties": {
+            "restart": {
+              "type": "object",
+              "properties": {
+                "max_attempts": {"type": "integer", "minimum": 0},
+                "backoff_seconds": {"type": "integer", "minimum": 0}
+              }
+            },
+            "drain_timeout_seconds": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

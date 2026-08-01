@@ -1,0 +1,12 @@
+# Observe-only agent (the safe default). Discovers and reports engines; it
+# cannot start, stop, or replace processes. Recommended for initial install and
+# migration (DESIGN.md 6.1).
+control_plane_url: https://meridian-control.internal:8443
+mode: observe-only
+state_dir: /var/lib/meridian-node
+display_name: gpu-host-a
+labels:
+  zone: in-west-1a
+  rack: r12
+heartbeat_interval_seconds: 10
+lease_ttl_seconds: 30

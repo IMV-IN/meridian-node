@@ -1,0 +1,17 @@
+{
+  "node_id": "node_01J000000000000000000000",
+  "agent_session_id": "session_01J000000000000000000000",
+  "sequence": 1842,
+  "observed_generation": 42,
+  "engines": [
+    {
+      "engine_id": "engine_01J000000000000000000000",
+      "phase": "Ready",
+      "restart_count": 0,
+      "loaded_artifact_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "endpoint": "https://10.0.0.5:8000",
+      "conditions": []
+    }
+  ],
+  "conditions": []
+}
