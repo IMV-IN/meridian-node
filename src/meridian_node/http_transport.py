@@ -9,6 +9,7 @@ here matches contracts/v1 and the fake control plane.
 
 from __future__ import annotations
 
+import urllib.parse
 from typing import Callable, Optional
 
 try:
@@ -41,12 +42,19 @@ class HttpTransport:
         cert: Optional[tuple[str, str]] = None,
         verify: str | bool = True,
         timeout: float = 35.0,
+        client_cert_pem: Optional[str] = None,
+        client_cert_header: str = "X-Client-Cert",
     ):
         self.base_url = base_url.rstrip("/")
         self.enrollment_token = enrollment_token
         # `cert` is (client_cert_path, client_key_path) for node mTLS; `verify`
         # points at the trust bundle. Injected `client` is used by tests.
         self._client = client or httpx.Client(cert=cert, verify=verify, timeout=timeout)
+        # The url-escaped node cert PEM, forwarded (XFCC-style) so the control
+        # plane can bind identity when the edge terminates TLS (DESIGN.md 15.6).
+        self._auth = (
+            {client_cert_header: urllib.parse.quote(client_cert_pem)} if client_cert_pem else {}
+        )
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -69,7 +77,9 @@ class HttpTransport:
         return _raise_for_envelope(resp)
 
     def establish_session(self, node_id: str, request: dict) -> dict:
-        resp = self._client.post(self._url(f"/control/v1/nodes/{node_id}/sessions"), json=request)
+        resp = self._client.post(
+            self._url(f"/control/v1/nodes/{node_id}/sessions"), json=request, headers=self._auth
+        )
         return _raise_for_envelope(resp)
 
     def heartbeat(self, node_id: str, request: dict) -> dict:
@@ -77,18 +87,22 @@ class HttpTransport:
         resp = self._client.post(
             self._url(f"/control/v1/nodes/{node_id}/heartbeat"),
             json=request,
-            headers={"Idempotency-Key": key},
+            headers={"Idempotency-Key": key, **self._auth},
         )
         return _raise_for_envelope(resp)
 
     def fetch_desired_state(self, node_id: str, generation: int) -> dict:
         resp = self._client.get(
-            self._url(f"/control/v1/nodes/{node_id}/desired-state"), params={"generation": generation}
+            self._url(f"/control/v1/nodes/{node_id}/desired-state"),
+            params={"generation": generation},
+            headers=self._auth,
         )
         return _raise_for_envelope(resp)
 
     def post_observation(self, node_id: str, observation: dict) -> dict:
-        resp = self._client.post(self._url(f"/control/v1/nodes/{node_id}/observations"), json=observation)
+        resp = self._client.post(
+            self._url(f"/control/v1/nodes/{node_id}/observations"), json=observation, headers=self._auth
+        )
         return _raise_for_envelope(resp)
 
     def close(self) -> None:

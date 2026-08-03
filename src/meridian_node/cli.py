@@ -20,11 +20,12 @@ from .control import ControlError
 
 
 def _run_loop(config: Config, once: bool, now=None) -> int:
-    from .wiring import build_agent, build_managed_reconciler
+    from .wiring import build_agent, build_managed_reconciler, upgrade_transport
 
     token = os.environ.get("MERIDIAN_NODE_TOKEN")
     agent = build_agent(config, token, now=now)
     agent.ensure_enrolled()
+    upgrade_transport(config, agent)  # present the node mTLS cert for the session
     agent.establish_session()
 
     if config.managed_allowed():
