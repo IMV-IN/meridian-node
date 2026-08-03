@@ -1641,47 +1641,43 @@ later phases.
 ## 24. Next Steps
 
 Phases 0–3 and the `meridian-control` service are implemented and merged. The
-frontier below is ordered by what unblocks production, most important first.
-The original Phase 0 checklist (contracts, fake control plane, identity, lease
-handling, NVIDIA inventory, compatibility target) is complete.
+frontier below tracks what unblocks production. **P0–P3 and Phase-4 cert
+rotation are now implemented and merged**; the remaining open work is the two
+Phase-4 modes and Phase 5, listed under "Remaining frontier" below.
 
-### P0 — Close the mTLS gate (unblocks managed-host production)
+### P0 — Close the mTLS gate (DONE)
 
-This is the single blocker for Decision 12. See Section 15.6.
+Decision 12 unblocked. See Section 15.6. The agent persists its enrolled cert and
+`wiring.upgrade_transport` presents it (client cert + XFCC-forwarded header) on
+every post-enrollment call; the control plane's `verify_node_identity` rejects a
+certificate whose SAN `node_id` differs from the path (default-off `require_mtls`,
+enabled behind the TLS-terminating edge). Cert/node-mismatch, revoked-node, and
+foreign-CA rejections are covered by tests.
 
-1. Agent: persist the enrolled certificate; after enrollment rebuild the
-   transport with `cert=(node_cert, node_key)` and `verify=trust_bundle`, so
-   all post-enrollment calls are mTLS. Fix `wiring.build_agent` to do the
-   two-phase (token transport for enroll, cert transport for the session).
-2. Control plane: terminate mTLS (or accept a verified-client-cert header from a
-   trusted proxy) and add a dependency on every `/control/v1/nodes/{node_id}/*`
-   route that rejects a certificate whose SAN `node_id` differs from the path.
-3. Certificate rotation before half-life and a revocation deny-list checked on
-   every heartbeat. Add contract tests for cert/node mismatch and revoked-node
-   rejection.
+### P1 — Gateway consumes the serving projection (DONE)
 
-### P1 — Gateway consumes the serving projection (unblocks traffic)
+The gateway's `control_plane` config + `ManagedProjectionSync` polls
+`meridian-control`'s serving projection and registers routable managed engines as
+dynamic backends alongside static config backends (static wins collisions;
+last-known-good kept on fetch failure; `routable` honored). Nodes report the
+served `model` per ready engine so the projection can carry it.
 
-Managed engines reach `Ready` but receive no traffic until the gateway routes to
-them. Wire the Meridian gateway to consume `meridian-control`'s serving
-projection as a `managed` inventory provider (Section 17.3): merge managed
-endpoints into the routing registry with the static/observed/managed conflict
-rules, honor `routable`, and drop endpoints on lease expiry within the admission
-staleness bound. This is the one change that touches live gateway code and must
-be reviewed independently.
+### P2 — Phase 4 breadth (partial: Ollama driver DONE)
 
-### P2 — Phase 4 breadth
-
-- Generic OpenAI, Ollama, and SGLang drivers beyond the current vLLM + generic.
+- ~~Ollama driver~~ implemented on the existing driver seam.
 - Kubernetes-integrated mode (report inventory; do not launch a second copy of a
-  cluster-scheduled engine).
+  cluster-scheduled engine). **Remaining.**
 - Air-gapped signed bundles through the same digest/verification path.
-- Certificate rotation and revocation automation hardening beyond the P0 gate.
+  **Remaining** — an offline `Transport` (signed desired-state bundles in, spooled
+  observations out) plus local manifest/fetch, reusing reconciler/supervisor/journal.
+- ~~Certificate rotation~~ implemented (agent renews before half-life via
+  `POST /control/v1/nodes/{id}/certificate`); revocation deny-list hardening remains.
 
-### P3 — Phase 5 placement and capacity
+### P3 — Phase 5 placement and capacity (partial: capacity reporting DONE)
 
-MIG parent/child constraints, VRAM reservations enforced at launch, artifact
-locality, and queue/capacity-aware assignment.
+The node reports authoritative allocatable VRAM + free ports per observation.
+**Remaining:** MIG parent/child constraints, VRAM reservations enforced at launch,
+artifact locality, and queue/capacity-aware assignment on the control side.
 
 ### Cross-cutting hardening
 
