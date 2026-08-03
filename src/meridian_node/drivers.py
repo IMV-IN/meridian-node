@@ -125,7 +125,49 @@ class GenericOpenAIDriver:
         return ReadinessSpec(path="/v1/models", served_model=str(assignment.parameters["served_model_name"]))
 
 
-_DRIVERS: dict[str, Driver] = {d.kind: d for d in (VllmDriver(), GenericOpenAIDriver())}
+class OllamaDriver:
+    """Ollama server (DESIGN.md 13, 24 P2). Serves an OpenAI-compatible API; the
+    model tag and runtime knobs map to OLLAMA_* env, never a free-form command."""
+
+    kind = "ollama"
+    _ALLOWED = {"served_model_name", "keep_alive", "num_parallel"}
+
+    def validate(self, assignment: Assignment, gpus: list[dict]) -> None:
+        if assignment.engine.kind != self.kind:
+            raise DriverError(f"driver {self.kind} cannot handle engine kind {assignment.engine.kind}")
+        _check_params(assignment.parameters, self._ALLOWED)
+        if "served_model_name" not in assignment.parameters:
+            raise DriverError("ollama requires served_model_name")
+        _require_devices(assignment, gpus)
+
+    def build_launch(self, assignment: Assignment, artifact_path: str, ownership_marker: str) -> LaunchRequest:
+        p = assignment.parameters
+        env = {
+            "OLLAMA_HOST": f"0.0.0.0:{assignment.resources.port}",
+            "OLLAMA_MODELS": artifact_path,
+            "NVIDIA_VISIBLE_DEVICES": ",".join(assignment.resources.device_ids),
+        }
+        if "keep_alive" in p:
+            env["OLLAMA_KEEP_ALIVE"] = str(p["keep_alive"])
+        if "num_parallel" in p:
+            env["OLLAMA_NUM_PARALLEL"] = str(p["num_parallel"])
+        return LaunchRequest(
+            engine_id=assignment.engine_id,
+            image_digest=assignment.engine.image_digest,
+            args=("serve",),
+            env=env,
+            device_ids=tuple(assignment.resources.device_ids),
+            artifact_mount=artifact_path,
+            port=assignment.resources.port,
+            ownership_marker=ownership_marker,
+            memory_limit_bytes=assignment.resources.memory_limit_bytes,
+        )
+
+    def readiness(self, assignment: Assignment) -> ReadinessSpec:
+        return ReadinessSpec(path="/v1/models", served_model=str(assignment.parameters["served_model_name"]))
+
+
+_DRIVERS: dict[str, Driver] = {d.kind: d for d in (VllmDriver(), GenericOpenAIDriver(), OllamaDriver())}
 
 
 def get_driver(kind: str) -> Driver:

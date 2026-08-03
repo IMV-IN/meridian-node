@@ -101,6 +101,17 @@ class EngineSupervisor:
     def state(self, engine_id: str) -> EngineState:
         return self._states.setdefault(engine_id, EngineState(engine_id=engine_id))
 
+    def capacity_report(self) -> dict:
+        """Allocatable capacity the control plane consumes for placement (P3).
+        Device VRAM comes from the reservation ledger's committed budget; free
+        ports come from the configured range minus reserved ports."""
+        reserved = self.reservations.reserved_ports()
+        free_ports = sum(1 for p in self.reservations.port_range if p not in reserved)
+        return {
+            "allocatable_vram_bytes": self.reservations.allocatable(),
+            "free_ports": free_ports,
+        }
+
     # --- discovery / adoption ------------------------------------------
     def discover(self, assignments: dict[str, Assignment]) -> None:
         """Classify running processes as adopted or orphaned (DESIGN.md 11.2)."""

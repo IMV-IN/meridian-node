@@ -95,6 +95,8 @@ def test_full_managed_loop_over_http(live_server, tmp_path):
     agent.tick()  # heartbeat -> fetch desired over HTTP -> reconcile -> observe over HTTP
     assert sup.state("engine_1").phase == P.WARMING
     assert core.observations[node_id]["engines"][0]["phase"] == "Warming"
+    # Capacity is reported for central placement (P3).
+    assert "allocatable_vram_bytes" in core.observations[node_id]["capacity"]
 
     runtime.mark_ready(sup.state("engine_1").handle.runtime_id, "test/model")
     agent.tick()
