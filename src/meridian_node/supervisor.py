@@ -81,6 +81,7 @@ class EngineSupervisor:
         trusted_keys: dict[str, bytes],
         fetcher,
         engine_host: str = "127.0.0.1",
+        nvlink_groups: Optional[dict] = None,
         now=_utcnow,
     ):
         self.node_id = node_id
@@ -93,6 +94,7 @@ class EngineSupervisor:
         self.trusted_keys = trusted_keys
         self._fetcher = fetcher
         self.engine_host = engine_host
+        self.nvlink_groups = nvlink_groups or {}
         self.now = now
         self.fencing_epoch = 0
         self._states: dict[str, EngineState] = {}
@@ -102,14 +104,19 @@ class EngineSupervisor:
         return self._states.setdefault(engine_id, EngineState(engine_id=engine_id))
 
     def capacity_report(self) -> dict:
-        """Allocatable capacity the control plane consumes for placement (P3).
-        Device VRAM comes from the reservation ledger's committed budget; free
-        ports come from the configured range minus reserved ports."""
+        """Allocatable capacity + placement signals the control plane consumes
+        (P3/P5). VRAM from the reservation ledger's committed budget; free ports
+        from the range; held artifacts for locality; running-engine load for
+        load-aware placement; NVLink groups for multi-GPU affinity."""
         reserved = self.reservations.reserved_ports()
         free_ports = sum(1 for p in self.reservations.port_range if p not in reserved)
+        running = sum(1 for st in self._states.values() if st.phase == EnginePhase.READY)
         return {
             "allocatable_vram_bytes": self.reservations.allocatable(),
             "free_ports": free_ports,
+            "held_artifacts": self.artifacts.held(),
+            "running_engines": running,
+            "nvlink_groups": dict(self.nvlink_groups),
         }
 
     # --- discovery / adoption ------------------------------------------

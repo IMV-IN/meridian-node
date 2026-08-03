@@ -141,6 +141,10 @@ class ArtifactStore:
     def has(self, manifest_digest: str) -> bool:
         return self._digest_dir(manifest_digest).is_dir()
 
+    def held(self) -> list[str]:
+        """Digests currently materialized in the cache (for placement locality)."""
+        return sorted("sha256:" + p.name for p in self.artifacts.iterdir() if p.is_dir())
+
     def path_for(self, manifest_digest: str) -> Path:
         d = self._digest_dir(manifest_digest)
         if not d.is_dir():

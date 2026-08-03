@@ -189,6 +189,33 @@ def test_artifact_materialize_verifies_and_promotes(tmp_path):
     assert store.materialize(verified, digest, LocalFetcher(tmp_path / "src"), "local") == path
 
 
+def test_capacity_report_includes_placement_signals(tmp_path):
+    from datetime import datetime, timezone
+
+    from engine_helpers import build_supervisor
+
+    from meridian_node.runtime import FakeRuntime
+
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"m.bin": b"w"})
+    sup = build_supervisor(tmp_path, FakeRuntime(), manifest, keys, tmp_path / "src",
+                           lambda: datetime.now(timezone.utc))
+    sup.nvlink_groups = {"GPU-0": "nv0", "GPU-1": "nv0"}
+    rep = sup.capacity_report()
+    assert set(rep) >= {"allocatable_vram_bytes", "free_ports", "held_artifacts",
+                        "running_engines", "nvlink_groups"}
+    assert rep["running_engines"] == 0
+    assert rep["held_artifacts"] == []
+    assert rep["nvlink_groups"] == {"GPU-0": "nv0", "GPU-1": "nv0"}
+
+
+def test_artifact_store_held_lists_materialized(tmp_path):
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"model.bin": b"w"})
+    store = ArtifactStore(tmp_path / "cache")
+    assert store.held() == []
+    store.materialize(verify_manifest(manifest, keys, digest), digest, LocalFetcher(tmp_path / "src"), "local")
+    assert store.held() == [digest]
+
+
 def test_artifact_rejects_corrupted_file(tmp_path):
     manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"model.bin": b"weights"})
     verified = verify_manifest(manifest, keys, digest)
