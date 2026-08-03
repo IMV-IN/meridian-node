@@ -64,9 +64,12 @@ class Agent:
         self.node_id: Optional[str] = row[0] if row else None
         self.certificate: Optional[str] = row[1] if row else None
 
-        # Reconciler is attached only in managed-host mode (Phase 2+). Observe-only
-        # agents never construct one, so they cannot start or stop engines.
+        # Reconciler is attached only in engine-launching modes. Observe-only and
+        # kubernetes-integrated agents never construct one, so they cannot start
+        # or stop engines. In kubernetes-integrated mode an engine observer
+        # reports (read-only) the engines the cluster scheduled on this node.
         self.reconciler = None
+        self.engine_observer = None
         self._cached_snapshot: Optional[dict] = None
 
     # --- enrollment -----------------------------------------------------
@@ -190,11 +193,20 @@ class Agent:
             raise ValueError(f"reconciler requires an engine-launching mode, not {self.config.mode!r}")
         self.reconciler = reconciler
 
+    def attach_observer(self, observer) -> None:
+        """Enable read-only engine observation (kubernetes-integrated mode). The
+        agent reports what the cluster scheduled here but never launches."""
+        if self.config.mode != "kubernetes-integrated":
+            raise ValueError(f"engine observer requires kubernetes-integrated mode, not {self.config.mode!r}")
+        self.engine_observer = observer
+
     def tick(self) -> dict:
-        """One managed-host cycle: heartbeat, fetch desired state if the
-        generation advanced, reconcile, and report observations (DESIGN.md 11)."""
+        """One cycle: heartbeat, then either reconcile (engine-launching modes) or
+        report observed engines (kubernetes-integrated), or nothing (observe-only)."""
         resp = self.heartbeat_once()
         if self.reconciler is None:
+            if self.engine_observer is not None:
+                self._report_observed_engines(resp["desired_generation"])
             return resp
 
         from .models import DesiredSnapshot
@@ -213,6 +225,20 @@ class Agent:
             observation["sequence"] = self.state.last_sequence()
             self.transport.post_observation(self.node_id, observation)
         return resp
+
+    def _report_observed_engines(self, desired_generation: int) -> None:
+        """kubernetes-integrated: report engines the cluster scheduled here.
+        Read-only — no launch, stop, or reconcile happens."""
+        assert self.engine_observer is not None and self.node_id
+        observation = {
+            "node_id": self.node_id,
+            "observed_generation": desired_generation,
+            "agent_session_id": self.session_id,
+            "sequence": self.state.last_sequence(),
+            "engines": self.engine_observer.observe(),
+            "conditions": [],
+        }
+        self.transport.post_observation(self.node_id, observation)
 
     def close(self) -> None:
         self.state.close()

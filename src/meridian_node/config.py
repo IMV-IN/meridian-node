@@ -58,6 +58,21 @@ class AirGapConfig(BaseModel):
     authority_keys: dict[str, str] = Field(default_factory=dict)
 
 
+class KubernetesConfig(BaseModel):
+    """kubernetes-integrated mode inputs (DESIGN.md 6.3). The agent reports
+    inventory and *observes* engines the cluster scheduled on this node — it never
+    launches them (the k8s control plane owns lifecycle). `node_name` filters pods
+    to this host (defaults to $MERIDIAN_K8S_NODE_NAME via the Downward API)."""
+
+    model_config = {"extra": "forbid"}
+
+    namespace: str = "default"
+    label_selector: str = "app.kubernetes.io/managed-by=meridian"
+    node_name: str = ""
+    engine_port_annotation: str = "meridian.io/engine-port"
+    model_annotation: str = "meridian.io/model"
+
+
 class Config(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -73,6 +88,7 @@ class Config(BaseModel):
     lease_ttl_seconds: int = Field(default=30, ge=1)
     policy: Policy = Field(default_factory=Policy)
     air_gap: AirGapConfig = Field(default_factory=AirGapConfig)
+    kubernetes: KubernetesConfig = Field(default_factory=KubernetesConfig)
 
     @field_validator("mode")
     @classmethod

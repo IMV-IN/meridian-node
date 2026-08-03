@@ -21,6 +21,11 @@ dependencies = [
 http = [
     "httpx",
 ]
+# kubernetes-integrated mode only (read-only pod observation). Not needed for the
+# managed-host, observe-only, or air-gapped modes.
+k8s = [
+    "kubernetes",
+]
 dev = [
     "ruff",
     "mypy",

@@ -21,7 +21,12 @@ from .control import ControlError
 
 
 def _run_loop(config: Config, once: bool, now=None) -> int:
-    from .wiring import build_agent, build_managed_reconciler, upgrade_transport
+    from .wiring import (
+        build_agent,
+        build_kubernetes_observer,
+        build_managed_reconciler,
+        upgrade_transport,
+    )
 
     token = os.environ.get("MERIDIAN_NODE_TOKEN")
     agent = build_agent(config, token, now=now)
@@ -33,6 +38,9 @@ def _run_loop(config: Config, once: bool, now=None) -> int:
     if config.managed_allowed():
         build_managed_reconciler(config, agent, now=now)
         print("running in managed-host mode", file=sys.stderr)
+    elif config.mode == "kubernetes-integrated":
+        build_kubernetes_observer(config, agent)
+        print("running in kubernetes-integrated mode (report-only, no engine launch)", file=sys.stderr)
     else:
         print(f"running in {config.mode} mode (no engine control)", file=sys.stderr)
 
