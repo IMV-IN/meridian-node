@@ -72,5 +72,5 @@ def test_observe_only_cannot_attach_reconciler(tmp_path, clock_factory):
     cfg = Config(control_plane_url="fake://cp", state_dir=tmp_path, mode="observe-only")
     agent = Agent(cfg, fake.presenting("auto"), now=clock)
     import pytest
-    with pytest.raises(ValueError, match="managed-host mode"):
+    with pytest.raises(ValueError, match="engine-launching mode"):
         agent.attach_reconciler(object())

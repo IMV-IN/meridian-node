@@ -20,12 +20,30 @@ def _decode_keys(trusted: dict[str, str]) -> dict[str, bytes]:
 
 
 def build_agent(config: Config, enrollment_token: str | None, now=None) -> Agent:
-    from .http_transport import HttpTransport
-
     kwargs = {}
     if now is not None:
         kwargs["now"] = now
-    transport = HttpTransport(config.control_plane_url, enrollment_token=enrollment_token)
+
+    from .control import Transport
+
+    transport: Transport
+    if config.mode == "air-gapped":
+        from .offline_transport import OfflineTransport
+
+        ag = config.air_gap
+        transport = OfflineTransport(
+            node_id=ag.node_id,
+            inbox_dir=ag.inbox_dir,
+            outbox_dir=ag.outbox_dir,
+            authority_keys=ag.authority_keys,
+            state_dir=config.state_dir,
+            lease_ttl_seconds=config.lease_ttl_seconds,
+            **({"now": now} if now is not None else {}),
+        )
+    else:
+        from .http_transport import HttpTransport
+
+        transport = HttpTransport(config.control_plane_url, enrollment_token=enrollment_token)
     return Agent(config, transport, **kwargs)
 
 
@@ -57,12 +75,11 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
         raise ValueError("agent must be enrolled before building the reconciler")
     node_id: str = agent.node_id
 
-    from .artifacts import ArtifactStore
+    from .artifacts import ArtifactStore, Fetcher
     from .inventory import NvmlProvider
     from .journal import Journal
     from .reservation import ReservationLedger
-    from .supervisor import EngineSupervisor
-    from .transfer import HttpFetcher, HttpManifestSource
+    from .supervisor import EngineSupervisor, ManifestSource
 
     policy = config.policy
     state_dir = Path(config.state_dir)
@@ -72,8 +89,16 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
         device_capacity=policy.device_capacity_bytes,
         port_range=range(policy.port_range[0], policy.port_range[1]),
     )
-    fetcher = HttpFetcher(policy.allowed_source_hosts)
-    manifests = HttpManifestSource(config.control_plane_url, policy.allowed_source_hosts)
+    if config.mode == "air-gapped":
+        from .local_artifacts import LocalFetcher, LocalManifestSource
+
+        fetcher: Fetcher = LocalFetcher(Path(config.air_gap.inbox_dir) / "artifacts")
+        manifests: ManifestSource = LocalManifestSource(config.air_gap.inbox_dir)
+    else:
+        from .transfer import HttpFetcher, HttpManifestSource
+
+        fetcher = HttpFetcher(policy.allowed_source_hosts)
+        manifests = HttpManifestSource(config.control_plane_url, policy.allowed_source_hosts)
 
     sup_kwargs = {}
     if now is not None:
