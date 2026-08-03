@@ -60,3 +60,16 @@ class ReservationLedger:
 
     def holds(self, engine_id: str) -> bool:
         return engine_id in self._by_engine
+
+    def allocatable(self) -> dict[str, int]:
+        """Authoritative per-device VRAM the node can still commit (DESIGN.md 24
+        P3). The committed budget, not observed free VRAM, is the placement
+        authority the control plane consumes for Phase-5 placement."""
+        out: dict[str, int] = {}
+        for dev, total in self.device_capacity.items():
+            committed = sum(r.gpu_memory_bytes for r in self._by_engine.values() if dev in r.device_ids)
+            out[dev] = max(0, total - committed)
+        return out
+
+    def reserved_ports(self) -> set[int]:
+        return {r.port for r in self._by_engine.values()}

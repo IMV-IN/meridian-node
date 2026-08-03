@@ -92,4 +92,5 @@ class Reconciler:
             "observed_generation": generation,
             "engines": engines,
             "conditions": orphan_conditions,
+            "capacity": self.supervisor.capacity_report(),
         }

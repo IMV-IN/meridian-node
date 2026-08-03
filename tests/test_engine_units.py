@@ -49,6 +49,24 @@ def test_driver_rejects_missing_device():
         driver.validate(a, [{"device_id": "some-other-gpu"}])
 
 
+def test_ollama_driver_build_launch_and_allowlist():
+    driver = get_driver("ollama")
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    a.engine.kind = "ollama"
+    a.parameters = {"served_model_name": "llama3", "keep_alive": "5m"}
+    driver.validate(a, [{"device_id": "GPU-fake-0"}])
+    req = driver.build_launch(a, "/models", "node:engine:op")
+    assert req.args == ("serve",)
+    assert req.env["OLLAMA_HOST"] == "0.0.0.0:8000"
+    assert req.env["OLLAMA_MODELS"] == "/models"
+    assert req.env["OLLAMA_KEEP_ALIVE"] == "5m"
+    assert driver.readiness(a).served_model == "llama3"
+
+    a.parameters["danger"] = "rm -rf"
+    with pytest.raises(DriverError, match="unknown engine parameters"):
+        driver.validate(a, [{"device_id": "GPU-fake-0"}])
+
+
 # --- reservation --------------------------------------------------------
 def test_reservation_over_commit_and_port_conflict():
     ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8100))
@@ -65,6 +83,17 @@ def test_reservation_port_range_enforced():
     ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8100))
     with pytest.raises(ReservationError, match="outside configured range"):
         ledger.reserve("e1", ["g0"], 1, 9000)
+
+
+def test_allocatable_capacity_reflects_reservations():
+    ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8002))
+    assert ledger.allocatable() == {"g0": 8 * 1024**3}
+    assert ledger.reserved_ports() == set()
+    ledger.reserve("e1", ["g0"], 3 * 1024**3, 8000)
+    assert ledger.allocatable() == {"g0": 5 * 1024**3}
+    assert ledger.reserved_ports() == {8000}
+    ledger.release("e1")
+    assert ledger.allocatable() == {"g0": 8 * 1024**3}
 
 
 # --- journal ------------------------------------------------------------
