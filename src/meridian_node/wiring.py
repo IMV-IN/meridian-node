@@ -29,6 +29,25 @@ def build_agent(config: Config, enrollment_token: str | None, now=None) -> Agent
     return Agent(config, transport, **kwargs)
 
 
+def upgrade_transport(config: Config, agent: Agent) -> None:
+    """After enrollment, swap the token transport for one that presents the node
+    mTLS client certificate on every call (DESIGN.md 15.6). No-op if the cert
+    material is absent (e.g. an older enrollment or a test fake)."""
+    from .http_transport import HttpTransport
+
+    state_dir = Path(config.state_dir)
+    crt, key = state_dir / "node.crt", state_dir / "node.key"
+    if not (crt.exists() and key.exists()):
+        return
+    # ponytail: verify defaults to system trust; add a serving-CA bundle option
+    # only if the control plane serves TLS from the built-in node CA.
+    agent.transport = HttpTransport(
+        config.control_plane_url,
+        cert=(str(crt), str(key)),
+        client_cert_pem=crt.read_text(),
+    )
+
+
 def build_managed_reconciler(config: Config, agent: Agent, now=None):
     """Construct the supervisor + reconciler for managed-host mode. Raises if the
     local policy has not enabled management (DESIGN.md 15.1)."""

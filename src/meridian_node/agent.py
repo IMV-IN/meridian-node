@@ -97,6 +97,12 @@ class Agent:
         self.node_id = resp["node_id"]
         self.certificate = resp["certificate"]
         self.state.save_identity(self.node_id, self.certificate, _iso(self.now()))
+        # Persist the mTLS material so a restart can present the client cert
+        # without re-enrolling (DESIGN.md 15.6). Key already lives at node.key.
+        state_dir = Path(self.config.state_dir)
+        (state_dir / "node.crt").write_text(self.certificate)
+        if resp.get("trust_bundle"):
+            (state_dir / "trust_bundle.pem").write_text(resp["trust_bundle"])
         self.state.clear_pending_claim()
         return self.node_id
 
