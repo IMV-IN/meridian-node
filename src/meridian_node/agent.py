@@ -108,7 +108,8 @@ class Agent:
         self.certificate = certificate
         self.state.save_identity(self.node_id, certificate, _iso(self.now()))
         state_dir = Path(self.config.state_dir)
-        (state_dir / "node.crt").write_text(certificate)
+        if certificate:  # air-gapped mode has no cert; don't write an empty file
+            (state_dir / "node.crt").write_text(certificate)
         if trust_bundle:
             (state_dir / "trust_bundle.pem").write_text(trust_bundle)
 
@@ -184,9 +185,9 @@ class Agent:
         return resp
 
     def attach_reconciler(self, reconciler) -> None:
-        """Enable managed-host reconciliation. Refused unless mode allows it."""
-        if self.config.mode != "managed-host":
-            raise ValueError(f"reconciler requires managed-host mode, not {self.config.mode!r}")
+        """Enable reconciliation. Refused unless the mode launches engines."""
+        if self.config.mode not in ("managed-host", "air-gapped"):
+            raise ValueError(f"reconciler requires an engine-launching mode, not {self.config.mode!r}")
         self.reconciler = reconciler
 
     def tick(self) -> dict:

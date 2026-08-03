@@ -288,6 +288,37 @@ launch a second copy of a Kubernetes-managed engine.
 The agent consumes preloaded signed bundle manifests and local artifact files.
 No network download is required. The same digest and readiness rules apply.
 
+**Implemented.** Air-gapped mode swaps only the agent's edges — the network
+transport and the artifact source — leaving the reconciler, supervisor, journal,
+reservation ledger, and drivers unchanged, because both edges already sit behind
+interfaces. The **signature on a desired-state bundle is the offline trust
+anchor** that replaces the mTLS session: online, desired state is trusted because
+it arrives over an authenticated channel; offline, because it is signed by a
+configured authority key (`air_gap.authority_keys`, distinct from the artifact
+publisher's `trusted_signing_keys`, so an artifact publisher cannot forge desired
+state).
+
+- **Identity** comes from local config (`air_gap.node_id`); the signed bundle is
+  addressed to that node, so the signature still gates what runs. Empty/invalid
+  config fails closed.
+- **`OfflineTransport`** implements the `Transport` contract with no network:
+  `fetch_desired_state` reads and verifies the highest-generation signed bundle
+  from `inbox/desired/`; `heartbeat` reports that generation and the bundle's
+  stop-authorized ids; `establish_session` mints a monotonic local fencing epoch
+  (restart-safe) so the root helper has its fence; `post_observation` spools JSON
+  to an outbox for the operator to collect; `rotate_certificate` is a no-op.
+- **Local artifacts** — `LocalManifestSource` + `LocalFetcher` read manifests and
+  files from the inbox and run the unchanged `verify_manifest` digest/signature
+  path, rejecting any file path that escapes the bundle root (the Phase-4 gate).
+- **Bundle authoring** — `meridian-node make-bundle` signs a desired-state
+  snapshot with an authority key; `airgap.verify_desired_bundle` is the agent-side
+  check. A missing or unverifiable bundle holds the last-known desired state and
+  is never applied.
+
+Inbox layout (operator-populated via removable media): `inbox/desired/*.json`
+(signed bundles, highest generation wins), `inbox/manifests/<digest>.json`,
+`inbox/artifacts/` (file tree).
+
 ### 6.5 First-release deployment profile
 
 To avoid making safety-critical behavior conditional on unresolved runtime
@@ -1634,16 +1665,16 @@ later phases.
       restarting every agent simultaneously. *(requires the central server.)*
 - [ ] Agent upgrade does not restart healthy engines. *(adoption implemented;
       full host test pending.)*
-- [ ] Air-gap mode can validate local artifacts without registry access. (Phase 4 gate.)
+- [x] Air-gap mode can validate local artifacts without registry access. (Phase 4 gate.)
 - [ ] Contract tests run against a central Meridian test server. *(harness ready
       in `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`.)*
 
 ## 24. Next Steps
 
 Phases 0–3 and the `meridian-control` service are implemented and merged. The
-frontier below tracks what unblocks production. **P0–P3 and Phase-4 cert
-rotation are now implemented and merged**; the remaining open work is the two
-Phase-4 modes and Phase 5, listed under "Remaining frontier" below.
+frontier below tracks what unblocks production. **P0–P3, Phase-4 cert rotation,
+and Phase-4 air-gapped mode are now implemented and merged**; the remaining open
+work is the Kubernetes-integrated mode and Phase 5, listed below.
 
 ### P0 — Close the mTLS gate (DONE)
 
@@ -1665,11 +1696,14 @@ served `model` per ready engine so the projection can carry it.
 ### P2 — Phase 4 breadth (partial: Ollama driver DONE)
 
 - ~~Ollama driver~~ implemented on the existing driver seam.
+- ~~Air-gapped mode~~ implemented (Section 6.4): `OfflineTransport` reads
+  signed desired-state bundles from an inbox and spools observations to an
+  outbox; `LocalManifestSource`/`LocalFetcher` verify local artifacts through the
+  same digest/signature path; the reconciler/supervisor/journal are unchanged.
+  The bundle signature (dedicated `air_gap.authority_keys`) is the offline trust
+  anchor that replaces the mTLS session. `meridian-node make-bundle` signs bundles.
 - Kubernetes-integrated mode (report inventory; do not launch a second copy of a
-  cluster-scheduled engine). **Remaining.**
-- Air-gapped signed bundles through the same digest/verification path.
-  **Remaining** — an offline `Transport` (signed desired-state bundles in, spooled
-  observations out) plus local manifest/fetch, reusing reconciler/supervisor/journal.
+  cluster-scheduled engine). **Remaining** — the last open Phase-4 mode.
 - ~~Certificate rotation~~ implemented (agent renews before half-life via
   `POST /control/v1/nodes/{id}/certificate`); revocation deny-list hardening remains.
 
