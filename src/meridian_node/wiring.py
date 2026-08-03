@@ -66,6 +66,19 @@ def upgrade_transport(config: Config, agent: Agent) -> None:
     )
 
 
+def build_kubernetes_observer(config: Config, agent: Agent) -> None:
+    """Attach a read-only Kubernetes engine observer (DESIGN.md 6.3). The agent
+    reports engines the cluster scheduled on this node; it never launches."""
+    if config.mode != "kubernetes-integrated":
+        raise ValueError("kubernetes observer requires kubernetes-integrated mode")
+    from .k8s import KubernetesEngineObserver
+
+    agent.attach_observer(KubernetesEngineObserver(config.kubernetes))
+    from .inventory import NvmlProvider
+
+    agent.inventory = NvmlProvider()
+
+
 def build_managed_reconciler(config: Config, agent: Agent, now=None):
     """Construct the supervisor + reconciler for managed-host mode. Raises if the
     local policy has not enabled management (DESIGN.md 15.1)."""

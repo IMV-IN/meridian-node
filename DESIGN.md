@@ -284,6 +284,17 @@ The agent reports node/GPU inventory and may manage a narrow local cache, while
 the central controller creates native Kubernetes workloads. The agent does not
 launch a second copy of a Kubernetes-managed engine.
 
+**Implemented.** This mode has no runtime, root helper, or reconciler, so it is
+structurally incapable of launching an engine (`managed_allowed()` is false and
+`attach_reconciler` refuses it). Instead a read-only `KubernetesEngineObserver`
+(the `k8s` extra) lists Meridian-labeled pods scheduled on this node
+(`spec.nodeName`), maps each to an engine observation — Ready only when the pod
+is Running + Ready and exposes an endpoint (from a port annotation) — and the
+agent reports them each heartbeat cycle. Central Meridian therefore sees
+cluster-scheduled engines, and Ready ones flow through the serving projection to
+the gateway exactly like managed-host engines. The pod→engine mapping is a pure,
+tested function; the Kubernetes client is injected in tests.
+
 ### 6.4 Air-gapped
 
 The agent consumes preloaded signed bundle manifests and local artifact files.
@@ -1702,7 +1713,7 @@ later phases.
 Phases 0–3 and the `meridian-control` service are implemented and merged. The
 frontier below tracks what unblocks production. **P0–P3, Phase-4 cert rotation,
 and Phase-4 air-gapped mode are now implemented and merged**; the remaining open
-work is the Kubernetes-integrated mode and Phase 5, listed below.
+work is Phase 5 (placement/capacity), listed below. Phase 4 is complete.
 
 ### P0 — Close the mTLS gate (DONE)
 
@@ -1730,8 +1741,9 @@ served `model` per ready engine so the projection can carry it.
   same digest/signature path; the reconciler/supervisor/journal are unchanged.
   The bundle signature (dedicated `air_gap.authority_keys`) is the offline trust
   anchor that replaces the mTLS session. `meridian-node make-bundle` signs bundles.
-- Kubernetes-integrated mode (report inventory; do not launch a second copy of a
-  cluster-scheduled engine). **Remaining** — the last open Phase-4 mode.
+- ~~Kubernetes-integrated mode~~ implemented (Section 6.3): a read-only
+  `KubernetesEngineObserver` reports cluster-scheduled engines on this node; the
+  mode is structurally incapable of launching. **Phase 4 is now complete.**
 - ~~Certificate rotation~~ implemented (agent renews before half-life via
   `POST /control/v1/nodes/{id}/certificate`); revocation deny-list hardening remains.
 
