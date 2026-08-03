@@ -30,7 +30,7 @@ meridian-node --config /etc/meridian-node/config.yaml check-config
 Enrollment is approval-gated by default: the node stays in a pending claim until
 an operator approves it (or the token was minted with `auto_approve`).
 
-## Managed-host (after the security gate)
+## Managed-host
 
 1. Install and start the root helper unit
    (`deploy/systemd/meridian-node-helper.service`). It owns the Docker lifecycle
@@ -41,6 +41,18 @@ an operator approves it (or the token was minted with `auto_approve`).
    budget.
 3. `management_enabled: false` is the kill switch — it stops lifecycle mutations
    without deleting state or killing running engines.
+4. In production, enable mTLS on the control plane (`require_mtls`, behind the
+   TLS-terminating edge). The agent presents its enrolled certificate on every
+   call and rotates it before expiry automatically.
+
+## Air-gapped
+
+No control channel. Set `mode: air-gapped` with an `air_gap` block (`node_id`,
+`inbox_dir`, `outbox_dir`, and one or more `authority_keys`). Desired state
+arrives as a **signed bundle** placed in `inbox/desired/`; observations spool to
+`outbox/`. Produce bundles with `meridian-node make-bundle` on a machine that
+holds the authority private key, then copy them (plus `inbox/manifests/` and
+`inbox/artifacts/`) to the host via removable media. See DESIGN.md §6.4.
 
 ## Container
 

@@ -47,12 +47,32 @@ First implementation of the node agent, built against `DESIGN.md`.
 - Enrollment now persists a pending claim and resumes it (across restart)
   instead of re-spending a used token.
 
-### Not yet included
-- Production central Meridian control plane wiring (compatibility harness in
-  `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`).
-- Kubernetes-integrated and air-gapped modes (Phase 4).
-- Placement and capacity scheduling (Phase 5).
-- Certificate rotation/revocation automation and full host tests on GPU
-  hardware.
+### Production frontier (P0–P4)
+- **mTLS enforced end to end (P0):** the agent presents its client certificate on
+  every post-enrollment call; the control plane's `verify_node_identity` binds the
+  cert SAN `node_id` to the path (no-cert → `NODE_NOT_AUTHORIZED`). Default-off
+  `require_mtls`, enabled behind the TLS-terminating edge.
+- **Gateway consumes the serving projection (P1):** nodes report the served model
+  per Ready engine; the Meridian gateway registers routable managed engines as
+  dynamic backends.
+- **Ollama driver (P2)** on the existing typed driver seam.
+- **Allocatable capacity reporting (P3):** authoritative VRAM + free ports per
+  observation, for central placement.
+- **Certificate rotation (Phase 4):** the agent renews before expiry via
+  `POST /control/v1/nodes/{id}/certificate`.
+- **Air-gapped mode (Phase 4):** signed desired-state bundles read from an inbox,
+  observations spooled to an outbox, local manifest/fetch through the unchanged
+  verification path; `make-bundle` CLI. The bundle signature (dedicated authority
+  key) is the offline trust anchor.
+- **End-to-end connection verified with numbers:** the full `node ↔ control ↔
+  gateway` path over a real socket with mTLS enforced
+  (`Meridian/scripts/verify_connection.py`, `test_cross_repo_gateway.py`).
 
-Tests: 69 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.
+### Not yet included
+- Kubernetes-integrated mode (last Phase-4 mode).
+- Placement and capacity scheduling (Phase 5: MIG/VRAM/locality).
+- Certificate **revocation** automation / CRL; Alembic migrations for
+  `meridian-control`; full host tests on GPU hardware.
+
+Tests: 81 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.
+Cross-repo: gateway 540, control + cross-repo 29.

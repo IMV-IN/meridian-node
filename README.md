@@ -17,9 +17,9 @@ additional environments without granting them lifecycle-control privileges.
 
 ## Status
 
-The agent is implemented through the reconciliation and managed-engine layers,
-with adapter seams (fakes in tests) at the hardware and network boundaries
-(NVML, Docker, mTLS HTTP) as the testing strategy prescribes.
+The agent is implemented through Phases 0–3 plus the Phase-4 certificate-rotation
+and air-gapped modes, with adapter seams (fakes in tests) at the hardware and
+network boundaries (NVML, Docker, mTLS HTTP) as the testing strategy prescribes.
 
 | Area | State |
 |---|---|
@@ -27,27 +27,35 @@ with adapter seams (fakes in tests) at the hardware and network boundaries
 | Identity, durable state, enrollment, heartbeat, lease | Implemented + tested |
 | Fencing / replay / restart recovery | Implemented + tested |
 | Artifact trust chain (signed manifest, digest, atomic promote, LRU) | Implemented + tested |
-| Engine drivers (vLLM, generic OpenAI) | Implemented + tested |
+| Engine drivers (vLLM, generic OpenAI, Ollama) | Implemented + tested |
 | Supervisor, operation journal, reservation, reconciliation | Implemented + tested |
 | Root helper privilege boundary | Implemented + tested (protocol); Docker backend is host-tested |
-| Real mTLS HTTP transport, NVML provider, metrics | Implemented (HTTP mapping + NVML degrade tested) |
+| **mTLS enforced end to end** (client cert presented + SAN bound to path) | Implemented + tested |
+| **Certificate rotation** (renew before expiry) | Implemented + tested |
+| **Allocatable capacity reporting** (VRAM + ports per observation) | Implemented + tested |
+| **Gateway consumes serving projection** (managed engines become routable backends) | Implemented + tested |
+| **Air-gapped mode** (signed offline bundles, inbox/outbox) | Implemented + tested |
+| NVML provider, metrics | Implemented (HTTP mapping + NVML degrade tested) |
 
-A runnable dev/reference control plane (`meridian-node-devserver`) implements
-the v1 wire protocol so the real HTTP transport and the managed loop can be
-driven end to end (`tests/test_live_server.py`). It is a development/CI tool,
-not the production `meridian-control` service (which belongs in the central
-Meridian repo, with Postgres and a real CA).
+The production central control plane exists as **`meridian-control`** in the
+[Meridian repo](https://github.com/IMV-IN/Meridian): FastAPI + SQLAlchemy
+(SQLite/Postgres) with a built-in Ed25519 CA. The full `node ↔ control ↔ gateway`
+path is verified end to end with mTLS enforced, with measured numbers — see
+`Meridian/scripts/verify_connection.py` and DESIGN.md §20.
 
-Not yet wired: the production central Meridian control plane (compat target in
-`tests/test_compat.py`), Kubernetes-integrated and air-gapped modes (Phase 4),
-and placement/capacity (Phase 5).
+A runnable dev/reference control plane (`meridian-node-devserver`) implements the
+v1 wire protocol so the real HTTP transport and the managed loop can be driven
+end to end (`tests/test_live_server.py`) without the production service.
+
+Remaining frontier: the **Kubernetes-integrated** mode (last Phase-4 mode) and
+Phase-5 placement/capacity (MIG/VRAM/locality).
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[http,dev]"
-pytest -q                    # 66 tests
+pytest -q                    # 81 tests
 ruff check src tests && mypy src/meridian_node
 
 # Validate a config and run one observe-only cycle against a control plane:
@@ -65,6 +73,19 @@ meridian-node-devserver --port 8443 --token dev-token:auto
 # Terminal 2: point the agent at it
 export MERIDIAN_NODE_TOKEN=dev-token
 meridian-node --config deploy/config.observe-only.yaml run --once   # control_plane_url: http://127.0.0.1:8443
+```
+
+### Air-gapped mode
+
+No control channel: desired state arrives as a **signed bundle** in an inbox and
+observations spool to an outbox (DESIGN.md §6.4). The bundle signature (a
+dedicated `air_gap.authority_keys`) is the offline trust anchor. Sign a bundle
+with an authority key, then run in `mode: air-gapped`:
+
+```bash
+meridian-node make-bundle --snapshot desired.json --key authority.pem \
+  --key-id auth1 --out inbox/desired/bundle.json
+meridian-node --config deploy/config.air-gapped.yaml run
 ```
 
 See [`docs/INSTALL.md`](docs/INSTALL.md), [`docs/SECURITY.md`](docs/SECURITY.md),

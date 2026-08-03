@@ -25,6 +25,15 @@ without deleting evidence or killing running engines.
 - Every session carries a server-issued, monotonic `fencing_epoch`. A stale
   agent session can never mutate current state, and a control-plane restore from
   backup cannot regress fencing (incarnation-ordered epochs, DESIGN 17.5).
+- **Transport auth is enforced end to end:** after enrollment the agent presents
+  its client certificate on every call and the control plane binds the cert's SAN
+  `node_id` to the path (a no-cert call is rejected). Certificates **rotate
+  automatically** before expiry (DESIGN 15.6). `require_mtls` is default-off for
+  dev and enabled behind the TLS-terminating edge.
+- **Air-gapped mode** has no live channel, so a **signed desired-state bundle**
+  (a dedicated authority key, distinct from artifact signing keys) is the trust
+  anchor that decides what may run; unsigned or tampered bundles are refused
+  (DESIGN 6.4).
 
 ## Privilege separation
 
@@ -48,8 +57,15 @@ Prompts, completions, bearer tokens, private keys, model credentials, and
 unrestricted environment values. Logs carry IDs, phases, reasons, and error
 classes only. Prometheus labels are bounded (DESIGN 19).
 
-## Gates before managed-host GA
+## Managed-host GA gates
 
-Managed lifecycle is blocked until production mTLS issuance, certificate
-rotation and revocation, lease fencing, signed runtime manifests, local policy
-enforcement, and central admission withdrawal are all in place (DESIGN 2, 21).
+The controls that previously blocked managed lifecycle are **in place**:
+production mTLS issuance and enforcement, certificate rotation, lease fencing
+(restore-safe), signed runtime manifests, local policy enforcement, and central
+admission withdrawal (the gateway consumes the serving projection). The full
+`node ↔ control ↔ gateway` path is verified end to end with mTLS enforced
+(DESIGN 15.6, 20).
+
+Remaining hardening: certificate **revocation** automation / CRL distribution
+(the revoke flag and deny path exist; automation does not yet), and Alembic
+migrations for the control-plane schema.

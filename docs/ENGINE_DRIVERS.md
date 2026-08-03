@@ -22,7 +22,8 @@ model is served, not merely because the process is alive.
 |---|---|---|
 | `vllm` | first-release | `served_model_name` (required), `max_model_len`, `tensor_parallel_size`, `dtype`, `gpu_memory_utilization` |
 | `openai-generic` | supported | `served_model_name` (required), `extra_args` (list of strings) |
-| `ollama`, `sglang` | planned (Phase 4) | — |
+| `ollama` | supported | `served_model_name` (required), `keep_alive`, `num_parallel` (mapped to `OLLAMA_*` env; OpenAI-compatible readiness) |
+| `sglang` | planned | — |
 
 Unknown parameters, unknown engine kinds, and devices absent from local
 inventory are rejected before launch.
