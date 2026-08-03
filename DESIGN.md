@@ -1747,11 +1747,19 @@ served `model` per ready engine so the projection can carry it.
 - ~~Certificate rotation~~ implemented (agent renews before half-life via
   `POST /control/v1/nodes/{id}/certificate`); revocation deny-list hardening remains.
 
-### P3 — Phase 5 placement and capacity (partial: capacity reporting DONE)
+### P3 — Phase 5 placement and capacity (in progress)
 
-The node reports authoritative allocatable VRAM + free ports per observation.
-**Remaining:** MIG parent/child constraints, VRAM reservations enforced at launch,
-artifact locality, and queue/capacity-aware assignment on the control side.
+- ~~Capacity reporting~~ — the node reports authoritative allocatable VRAM + free
+  ports per observation.
+- ~~VRAM reservations enforced at launch~~ — the reservation ledger rejects an
+  over-commit before launch.
+- ~~MIG parent/child constraints~~ — the ledger enforces physical/MIG-child
+  exclusivity at launch, using the NVML-derived topology (`topology` map).
+- ~~Capacity-aware assignment on the control side~~ — `meridian-control`'s
+  `select_placement` picks a routable node/device with enough reported allocatable
+  VRAM.
+- **Remaining:** artifact locality (prefer nodes that already cache the artifact),
+  queue-depth-aware assignment, and multi-GPU topology/NVLink affinity.
 
 ### Cross-cutting hardening
 
