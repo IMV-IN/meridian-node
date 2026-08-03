@@ -80,6 +80,8 @@ class Reconciler:
                 "restart_count": st.restart_count,
                 "loaded_artifact_digest": loaded,
                 "endpoint": endpoint,
+                # Model the gateway routes on; operators may override via parameters.
+                "model": assignment.parameters.get("model") or assignment.artifact.artifact_id,
                 "conditions": [st.condition(now)],
             })
         orphan_conditions = [
