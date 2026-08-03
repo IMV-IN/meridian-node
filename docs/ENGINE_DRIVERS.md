@@ -22,8 +22,16 @@ model is served, not merely because the process is alive.
 |---|---|---|
 | `vllm` | first-release | `served_model_name` (required), `max_model_len`, `tensor_parallel_size`, `dtype`, `gpu_memory_utilization` |
 | `openai-generic` | supported | `served_model_name` (required), `extra_args` (list of strings) |
-| `ollama` | supported | `served_model_name` (required), `keep_alive`, `num_parallel` (mapped to `OLLAMA_*` env; OpenAI-compatible readiness) |
-| `sglang` | planned | — |
+| `ollama` | supported | `served_model_name` (required), `keep_alive`, `num_parallel` (mapped to `OLLAMA_*` env) |
+| `tgi` | supported | `served_model_name` (required), `max_input_tokens`, `max_total_tokens`, `num_shard`, `quantize`, `dtype` |
+| `sglang` | supported | `served_model_name` (required), `tp_size`, `dtype`, `context_length`, `mem_fraction_static` |
+| `llamacpp` | supported | `served_model_name` (required), `ctx_size`, `n_gpu_layers`, `parallel` |
+| `lmdeploy` | supported | `served_model_name` (required), `tp`, `session_len`, `cache_max_entry_count` |
+
+All except `vllm`/`ollama` share `_OpenAIServerDriver`: the engine image's
+entrypoint is the server; the driver supplies only validated flags + env. These
+cover the OpenAI-compatible servers the Meridian gateway proxies. `tensorrt-llm`
+is deferred — it needs a prebuilt-engine host profile, not just flag mapping.
 
 Unknown parameters, unknown engine kinds, and devices absent from local
 inventory are rejected before launch.
