@@ -85,9 +85,18 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
     state_dir = Path(config.state_dir)
     store = ArtifactStore(state_dir / "artifacts")
     journal = Journal(state_dir / "journal.db")
+    # MIG topology for parent/child exclusivity at launch (Phase 5). Best-effort:
+    # a physical-only host (or missing NVML) yields an empty topology and the
+    # ledger falls back to VRAM/port checks only.
+    provider = NvmlProvider()
+    try:
+        topology = {g["device_id"]: g.get("parent_device_id") for g in provider.gpus()}
+    except Exception:
+        topology = {}
     ledger = ReservationLedger(
         device_capacity=policy.device_capacity_bytes,
         port_range=range(policy.port_range[0], policy.port_range[1]),
+        topology=topology,
     )
     if config.mode == "air-gapped":
         from .local_artifacts import LocalFetcher, LocalManifestSource
@@ -119,7 +128,7 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
     reconciler = Reconciler(node_id, supervisor, agent.state, **sup_kwargs)
     agent.attach_reconciler(reconciler)
     # NVML provider is the source of truth for local inventory in managed mode.
-    agent.inventory = NvmlProvider()
+    agent.inventory = provider
     return reconciler
 
 

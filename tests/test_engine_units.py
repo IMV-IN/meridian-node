@@ -85,6 +85,30 @@ def test_reservation_port_range_enforced():
         ledger.reserve("e1", ["g0"], 1, 9000)
 
 
+def test_mig_parent_child_exclusivity():
+    g = 1024**3
+    cap = {"GPU-0": 40 * g, "GPU-0/mig0": 10 * g, "GPU-0/mig1": 10 * g,
+           "GPU-1": 40 * g, "GPU-1/mig0": 10 * g}
+    topo = {"GPU-0": None, "GPU-0/mig0": "GPU-0", "GPU-0/mig1": "GPU-0",
+            "GPU-1": None, "GPU-1/mig0": "GPU-1"}
+    ledger = ReservationLedger(device_capacity=cap, port_range=range(8000, 8100), topology=topo)
+
+    ledger.reserve("e1", ["GPU-0/mig0"], 5 * g, 8000)  # a MIG child
+    ledger.reserve("e2", ["GPU-0/mig1"], 5 * g, 8001)  # sibling child — allowed
+    # The whole physical GPU is now excluded (its children are reserved).
+    with pytest.raises(ReservationError, match="MIG exclusivity"):
+        ledger.reserve("e3", ["GPU-0"], 5 * g, 8002)
+
+    # Reverse direction: reserving a whole GPU excludes its children.
+    ledger.reserve("e4", ["GPU-1"], 5 * g, 8003)
+    with pytest.raises(ReservationError, match="MIG exclusivity"):
+        ledger.reserve("e5", ["GPU-1/mig0"], 5 * g, 8004)
+
+    # Physical-only ledger (empty topology) applies no MIG check.
+    plain = ReservationLedger(device_capacity={"g0": 8 * g}, port_range=range(8000, 8100))
+    plain.reserve("x", ["g0"], 1 * g, 8000)
+
+
 def test_allocatable_capacity_reflects_reservations():
     ledger = ReservationLedger(device_capacity={"g0": 8 * 1024**3}, port_range=range(8000, 8002))
     assert ledger.allocatable() == {"g0": 8 * 1024**3}
