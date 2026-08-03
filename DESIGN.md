@@ -1,7 +1,9 @@
 # Meridian Node Agent Design
 
-**Status:** Implemented (Phases 0–3); managed-host production gated on mTLS
-enforcement and gateway projection wiring (Sections 1.1, 24)
+**Status:** Implemented (Phases 0–3 + Phase-4 cert rotation & air-gapped mode);
+mTLS enforced end to end and gateway projection wired; connection verified with
+numbers (Sections 1.1, 20, 24). Remaining frontier: kubernetes-integrated mode,
+Phase-5 placement.
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -9,7 +11,7 @@ enforcement and gateway projection wiring (Sections 1.1, 24)
 
 **Authors:** IMV-IN
 
-**Last updated:** 2026-08-01
+**Last updated:** 2026-08-04
 
 ### Normative language
 
@@ -43,31 +45,30 @@ use the host's native runtime where possible.
 
 ### 1.1 Implementation status
 
-As of 2026-08-01 the agent is implemented through Phases 0–3 with adapter seams
-at the hardware and network boundaries (NVML, Docker, mTLS HTTP), fake-driven per
-the testing strategy in Section 20. The central control plane exists as
-`meridian-control` in the Meridian repository: FastAPI + SQLAlchemy (SQLite by
-default, Postgres via a URL), a built-in Ed25519 CA issuing real node
-certificates, and restore-safe fencing per Section 17.5. A cross-repository test
-drives the real agent against the real control plane over HTTP.
+As of 2026-08-04 the agent is implemented through Phases 0–3 plus the Phase-4
+certificate-rotation and air-gapped modes, with adapter seams at the hardware and
+network boundaries (NVML, Docker, mTLS HTTP), fake-driven per the testing
+strategy in Section 20. The central control plane exists as `meridian-control` in
+the Meridian repository: FastAPI + SQLAlchemy (SQLite by default, Postgres via a
+URL), a built-in Ed25519 CA issuing real node certificates, and restore-safe
+fencing per Section 17.5.
 
-Two gates remain open before this is production-grade for managed hosts, and
-they are the current frontier (Section 24):
+The two gates that previously blocked managed-host production are **closed**:
 
-- **Transport authentication is not yet enforced.** The agent presents a
-  one-time token at enrollment and is issued a certificate, but subsequent
-  session, heartbeat, and observation calls are authenticated only by the path
-  `node_id` plus session fencing — the issued certificate is not presented by
-  the client nor verified by the server. Managed-host mode MUST remain gated
-  (Decision 12) until mTLS is enforced end to end (Section 15.6).
-- **The gateway does not yet consume the serving projection.** Managed engines
-  reach `Ready` and are published by `meridian-control`, but the Meridian
-  gateway does not yet route to them. Until the projection is wired
-  (Section 24), managed engines are observable but do not receive application
-  traffic.
+- **Transport authentication is enforced (Section 15.6).** After enrollment the
+  agent presents its client certificate on every call; the control plane's
+  `verify_node_identity` binds the certificate's SAN `node_id` to the path (a
+  no-cert call is rejected with `NODE_NOT_AUTHORIZED`). `require_mtls` is
+  default-off for dev and enabled behind the TLS-terminating edge. Certificates
+  rotate automatically before expiry.
+- **The gateway consumes the serving projection.** `meridian-control` publishes
+  Ready engines (with served model), and the gateway's `ManagedProjectionSync`
+  registers routable managed engines as dynamic backends.
 
-Everything below describes the intended contract; where the current code does
-not yet meet it, the gap is called out at Sections 15.6 and 24.
+The full `node ↔ control ↔ gateway` path is verified end to end with mTLS
+enforced, with measured numbers — see Section 20 ("End-to-end connection
+verification"). The remaining frontier (Section 24) is the kubernetes-integrated
+mode and Phase-5 placement.
 
 ## 2. Decision Summary
 
@@ -1533,6 +1534,33 @@ They are computed from the metrics above via recording rules:
 - All gateway replicas converging on admission withdrawal.
 - Static and managed inventory conflict/adoption.
 - Control plane sending a validly authenticated assignment forbidden by local policy.
+
+### End-to-end connection verification (implemented)
+
+The full `meridian-node ↔ meridian-control ↔ gateway` path is verified over a
+real HTTP socket with mTLS enforcement (`require_mtls=True`), both as a durable
+test (`Meridian/tests/control/test_cross_repo_gateway.py`, driving the real node
+agent against the real control plane) and as a numbers harness
+(`Meridian/scripts/verify_connection.py`). The harness exercises enrollment, the
+mTLS gate (no-cert rejected with `NODE_NOT_AUTHORIZED`, cert accepted), session
+fencing, 50 sequential heartbeats, desired-state publish/fetch, a Ready-engine
+observation, the control serving projection, gateway backend registration via
+`ManagedProjectionSync`, and certificate rotation. Representative run (localhost,
+SQLite `synchronous=FULL`, per-request forwarded-cert verification):
+
+| Step | Measured |
+|---|---|
+| enroll (token) | ~38 ms |
+| mTLS gate | no-cert → `NODE_NOT_AUTHORIZED`; cert session epoch=1 in ~20 ms |
+| heartbeat ×50 | min 23.7 / mean 24.6 / p95 25.9 / max 26.1 ms; last_seq=50 |
+| desired publish+fetch | gen=7 fetched in ~3.8 ms |
+| observation post | ~19 ms (1 Ready engine, `model=demo/model`) |
+| control projection | 1 endpoint, 1 routable, ~6 ms |
+| gateway registration | backends 0 → 1; `eligible['demo/model'] = managed:<node>:engine_1` |
+| cert rotation | rotated in ~20 ms; post-rotation heartbeat accepted |
+
+Suite totals at time of writing: meridian-node **81**, gateway **540**,
+control + cross-repo **29**; ruff + mypy clean across all three.
 
 ### Host tests
 
