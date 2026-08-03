@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from cryptography import x509
+
 from . import AGENT_VERSION, PROTOCOL_VERSION
 from .config import Config
 from .control import ControlError, Transport
@@ -95,16 +97,39 @@ class Agent:
 
     def _accept_enrollment(self, resp: dict) -> str:
         self.node_id = resp["node_id"]
-        self.certificate = resp["certificate"]
-        self.state.save_identity(self.node_id, self.certificate, _iso(self.now()))
-        # Persist the mTLS material so a restart can present the client cert
-        # without re-enrolling (DESIGN.md 15.6). Key already lives at node.key.
-        state_dir = Path(self.config.state_dir)
-        (state_dir / "node.crt").write_text(self.certificate)
-        if resp.get("trust_bundle"):
-            (state_dir / "trust_bundle.pem").write_text(resp["trust_bundle"])
+        self._persist_certificate(resp["certificate"], resp.get("trust_bundle"))
         self.state.clear_pending_claim()
         return self.node_id
+
+    def _persist_certificate(self, certificate: str, trust_bundle: Optional[str]) -> None:
+        """Persist the mTLS material so a restart can present the client cert
+        without re-enrolling (DESIGN.md 15.6). Key already lives at node.key."""
+        assert self.node_id is not None
+        self.certificate = certificate
+        self.state.save_identity(self.node_id, certificate, _iso(self.now()))
+        state_dir = Path(self.config.state_dir)
+        (state_dir / "node.crt").write_text(certificate)
+        if trust_bundle:
+            (state_dir / "trust_bundle.pem").write_text(trust_bundle)
+
+    def maybe_rotate_certificate(self, renew_before_fraction: float = 0.5) -> bool:
+        """Renew the node cert once it is past `renew_before_fraction` of its
+        lifetime, so an enforced-mTLS session never breaks on expiry (Phase 4).
+        Returns True if a new cert was obtained (the caller must then rebuild the
+        transport to present it). Unparseable certs (dev/reference fakes) skip."""
+        if not self.node_id or not self.certificate:
+            return False
+        try:
+            cert = x509.load_pem_x509_certificate(self.certificate.encode())
+            lifetime = cert.not_valid_after_utc - cert.not_valid_before_utc
+            remaining = cert.not_valid_after_utc - self.now()
+        except (ValueError, TypeError):
+            return False
+        if remaining > lifetime * renew_before_fraction:
+            return False
+        resp = self.transport.rotate_certificate(self.node_id)
+        self._persist_certificate(resp["certificate"], resp.get("trust_bundle"))
+        return True
 
     def _await_claim(self, claim_id: str, poll_interval: float, max_polls: int) -> dict:
         for _ in range(max_polls):

@@ -105,5 +105,11 @@ class HttpTransport:
         )
         return _raise_for_envelope(resp)
 
+    def rotate_certificate(self, node_id: str) -> dict:
+        resp = self._client.post(
+            self._url(f"/control/v1/nodes/{node_id}/certificate"), headers=self._auth
+        )
+        return _raise_for_envelope(resp)
+
     def close(self) -> None:
         self._client.close()

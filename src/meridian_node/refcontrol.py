@@ -204,3 +204,13 @@ class ControlCore:
             raise ControlError("NODE_NOT_FOUND", "unknown node", http_status=404)
         self.observations[node_id] = observation
         return {"received": True}
+
+    # --- certificate rotation (Phase 4) --------------------------------
+    def rotate_certificate(self, node_id: str) -> dict:
+        if node_id not in self.nodes:
+            raise ControlError("NODE_NOT_FOUND", "unknown node", http_status=404)
+        return {
+            "certificate": f"FAKE-CERT-{node_id}-rotated",
+            "trust_bundle": "FAKE-TRUST-BUNDLE",
+            "cert_lifetime_hours": 24,
+        }

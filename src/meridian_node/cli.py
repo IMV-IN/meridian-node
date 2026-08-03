@@ -37,6 +37,9 @@ def _run_loop(config: Config, once: bool, now=None) -> int:
     backoff = 1.0
     while True:
         try:
+            if agent.maybe_rotate_certificate():
+                upgrade_transport(config, agent)  # present the freshly rotated cert
+                print("rotated node certificate", file=sys.stderr)
             agent.tick()
             backoff = 1.0
         except ControlError as e:

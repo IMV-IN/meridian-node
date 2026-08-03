@@ -89,6 +89,9 @@ class FakeControlPlane:
     def post_observation(self, node_id: str, observation: dict) -> dict:
         return self._wrap(self.core.post_observation, node_id, observation)
 
+    def rotate_certificate(self, node_id: str) -> dict:
+        return self._wrap(self.core.rotate_certificate, node_id)
+
     # --- operator/test hooks -------------------------------------------
     def approve_claim(self, claim_id: str) -> None:
         self.core.approve_claim(claim_id)

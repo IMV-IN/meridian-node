@@ -27,6 +27,7 @@ _SESSION = re.compile(r"^/control/v1/nodes/([^/]+)/sessions$")
 _HEARTBEAT = re.compile(r"^/control/v1/nodes/([^/]+)/heartbeat$")
 _DESIRED = re.compile(r"^/control/v1/nodes/([^/]+)/desired-state$")
 _OBSERVE = re.compile(r"^/control/v1/nodes/([^/]+)/observations$")
+_CERT = re.compile(r"^/control/v1/nodes/([^/]+)/certificate$")
 _ADMIN_APPROVE = re.compile(r"^/admin/claims/([^/]+)/approve$")
 _ADMIN_DESIRED = re.compile(r"^/admin/nodes/([^/]+)/desired$")
 _ADMIN_STOP = re.compile(r"^/admin/nodes/([^/]+)/stop-authorize$")
@@ -106,6 +107,10 @@ def make_handler(core: ControlCore):
                 m = _OBSERVE.match(path)
                 if m:
                     self._send(200, core.post_observation(m.group(1), body))
+                    return
+                m = _CERT.match(path)
+                if m:
+                    self._send(200, core.rotate_certificate(m.group(1)))
                     return
                 m = _ADMIN_APPROVE.match(path)
                 if m:
