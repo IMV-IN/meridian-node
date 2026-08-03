@@ -136,6 +136,7 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
         trusted_keys=_decode_keys(policy.trusted_signing_keys),
         fetcher=fetcher,
         engine_host=policy.engine_host,
+        nvlink_groups=policy.device_nvlink_groups,
         **sup_kwargs,
     )
     reconciler = Reconciler(node_id, supervisor, agent.state, **sup_kwargs)

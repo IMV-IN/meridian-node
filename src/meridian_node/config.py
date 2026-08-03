@@ -32,6 +32,10 @@ class Policy(BaseModel):
     allowed_source_hosts: list[str] = Field(default_factory=list)
     port_range: list[int] = Field(default=[8000, 8100])  # [start, stop)
     device_capacity_bytes: dict[str, int] = Field(default_factory=dict)
+    # Operator-declared NVLink/affinity groups: device_id -> group id. Reported so
+    # the control plane can place a multi-GPU engine on NVLink-connected devices
+    # (Phase 5). Empty => no affinity constraint.
+    device_nvlink_groups: dict[str, str] = Field(default_factory=dict)
     engine_host: str = "127.0.0.1"
     helper_socket_path: str = "/run/meridian-node/helper.sock"
 
