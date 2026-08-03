@@ -17,9 +17,10 @@ additional environments without granting them lifecycle-control privileges.
 
 ## Status
 
-The agent is implemented through Phases 0–3 plus the Phase-4 certificate-rotation
-and air-gapped modes, with adapter seams (fakes in tests) at the hardware and
-network boundaries (NVML, Docker, mTLS HTTP) as the testing strategy prescribes.
+The agent is implemented through Phases 0–4 (Phase 5 in progress), with adapter
+seams (fakes in tests) at the hardware and network boundaries (NVML, Docker, mTLS
+HTTP) as the testing strategy prescribes. All four modes ship (observe-only,
+managed-host, kubernetes-integrated, air-gapped) and seven engine drivers.
 
 | Area | State |
 |---|---|
@@ -27,7 +28,9 @@ network boundaries (NVML, Docker, mTLS HTTP) as the testing strategy prescribes.
 | Identity, durable state, enrollment, heartbeat, lease | Implemented + tested |
 | Fencing / replay / restart recovery | Implemented + tested |
 | Artifact trust chain (signed manifest, digest, atomic promote, LRU) | Implemented + tested |
-| Engine drivers (vLLM, generic OpenAI, Ollama) | Implemented + tested |
+| Engine drivers (vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp, LMDeploy) | Implemented + tested |
+| Modes: observe-only, managed-host, kubernetes-integrated (read-only), air-gapped | Implemented + tested |
+| Placement: MIG parent/child + VRAM enforced at launch; control-side capacity-aware node selection | Implemented + tested |
 | Supervisor, operation journal, reservation, reconciliation | Implemented + tested |
 | Root helper privilege boundary | Implemented + tested (protocol); Docker backend is host-tested |
 | **mTLS enforced end to end** (client cert presented + SAN bound to path) | Implemented + tested |
@@ -47,15 +50,16 @@ A runnable dev/reference control plane (`meridian-node-devserver`) implements th
 v1 wire protocol so the real HTTP transport and the managed loop can be driven
 end to end (`tests/test_live_server.py`) without the production service.
 
-Remaining frontier: the **Kubernetes-integrated** mode (last Phase-4 mode) and
-Phase-5 placement/capacity (MIG/VRAM/locality).
+Remaining frontier: Phase-5 placement breadth — artifact locality, queue-depth-
+aware assignment, and multi-GPU/NVLink affinity. (MIG/VRAM enforcement at launch
+and capacity-aware node selection are done.)
 
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[http,dev]"
-pytest -q                    # 81 tests
+pytest -q                    # 92 tests
 ruff check src tests && mypy src/meridian_node
 
 # Validate a config and run one observe-only cycle against a control plane:

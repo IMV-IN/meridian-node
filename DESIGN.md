@@ -1,9 +1,11 @@
 # Meridian Node Agent Design
 
-**Status:** Implemented (Phases 0–3 + Phase-4 cert rotation & air-gapped mode);
-mTLS enforced end to end and gateway projection wired; connection verified with
-numbers (Sections 1.1, 20, 24). Remaining frontier: kubernetes-integrated mode,
-Phase-5 placement.
+**Status:** Implemented (Phases 0–4 complete; Phase 5 in progress). mTLS enforced
+end to end, gateway projection wired, connection verified with numbers (Sections
+1.1, 20, 24). Drivers: vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp,
+LMDeploy. Modes: observe-only, managed-host, kubernetes-integrated, air-gapped.
+Remaining: Phase-5 placement breadth (artifact locality, queue-aware assignment,
+NVLink affinity).
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -45,13 +47,16 @@ use the host's native runtime where possible.
 
 ### 1.1 Implementation status
 
-As of 2026-08-04 the agent is implemented through Phases 0–3 plus the Phase-4
-certificate-rotation and air-gapped modes, with adapter seams at the hardware and
-network boundaries (NVML, Docker, mTLS HTTP), fake-driven per the testing
-strategy in Section 20. The central control plane exists as `meridian-control` in
-the Meridian repository: FastAPI + SQLAlchemy (SQLite by default, Postgres via a
-URL), a built-in Ed25519 CA issuing real node certificates, and restore-safe
-fencing per Section 17.5.
+As of 2026-08-04 the agent is implemented through Phases 0–4 (Phase 5 in
+progress), with adapter seams at the hardware and network boundaries (NVML,
+Docker, mTLS HTTP), fake-driven per the testing strategy in Section 20. All four
+modes are implemented — observe-only, managed-host, kubernetes-integrated (Section
+6.3, read-only observation), and air-gapped (Section 6.4, signed bundles) — and
+seven engine drivers (vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp,
+LMDeploy). The central control plane exists as `meridian-control` in the Meridian
+repository: FastAPI + SQLAlchemy (SQLite by default, Postgres via a URL), a
+built-in Ed25519 CA issuing real node certificates, and restore-safe fencing per
+Section 17.5.
 
 The two gates that previously blocked managed-host production are **closed**:
 
@@ -67,8 +72,9 @@ The two gates that previously blocked managed-host production are **closed**:
 
 The full `node ↔ control ↔ gateway` path is verified end to end with mTLS
 enforced, with measured numbers — see Section 20 ("End-to-end connection
-verification"). The remaining frontier (Section 24) is the kubernetes-integrated
-mode and Phase-5 placement.
+verification"). The remaining frontier (Section 24) is Phase-5 placement breadth
+(artifact locality, queue-depth-aware assignment, multi-GPU/NVLink affinity);
+MIG/VRAM enforcement at launch and capacity-aware node selection are done.
 
 ## 2. Decision Summary
 

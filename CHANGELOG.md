@@ -68,11 +68,22 @@ First implementation of the node agent, built against `DESIGN.md`.
   gateway` path over a real socket with mTLS enforced
   (`Meridian/scripts/verify_connection.py`, `test_cross_repo_gateway.py`).
 
+### Phase 4 complete + Phase 5 (in progress)
+- **Engine breadth:** drivers for all OpenAI-compatible gateway engines — TGI,
+  SGLang, llama.cpp, LMDeploy (shared `_OpenAIServerDriver`), joining
+  vLLM/Ollama/generic-OpenAI.
+- **kubernetes-integrated mode (Phase 4 complete):** read-only
+  `KubernetesEngineObserver` reports cluster-scheduled engines on this node;
+  structurally cannot launch.
+- **Placement (Phase 5):** MIG parent/child exclusivity + VRAM enforced at launch
+  in the reservation ledger; control-side `select_placement` capacity-aware node
+  selection (`POST /admin/place`).
+
 ### Not yet included
-- Kubernetes-integrated mode (last Phase-4 mode).
-- Placement and capacity scheduling (Phase 5: MIG/VRAM/locality).
+- Phase-5 breadth: artifact locality, queue-depth-aware assignment, multi-GPU/
+  NVLink affinity.
 - Certificate **revocation** automation / CRL; Alembic migrations for
   `meridian-control`; full host tests on GPU hardware.
 
-Tests: 81 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.
-Cross-repo: gateway 540, control + cross-repo 29.
+Tests: 92 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.
+Cross-repo: gateway 540, control + cross-repo 31.
