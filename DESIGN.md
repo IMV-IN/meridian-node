@@ -1,6 +1,7 @@
 # Meridian Node Agent Design
 
-**Status:** Draft RFC
+**Status:** Implemented (Phases 0–3); managed-host production gated on mTLS
+enforcement and gateway projection wiring (Sections 1.1, 24)
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -39,6 +40,34 @@ The first implementation must not attempt to replace Kubernetes, Slurm,
 Terraform, Ansible, Docker, or systemd as a general scheduler. It should provide
 a narrow, declarative contract for a Meridian-managed inference assignment and
 use the host's native runtime where possible.
+
+### 1.1 Implementation status
+
+As of 2026-08-01 the agent is implemented through Phases 0–3 with adapter seams
+at the hardware and network boundaries (NVML, Docker, mTLS HTTP), fake-driven per
+the testing strategy in Section 20. The central control plane exists as
+`meridian-control` in the Meridian repository: FastAPI + SQLAlchemy (SQLite by
+default, Postgres via a URL), a built-in Ed25519 CA issuing real node
+certificates, and restore-safe fencing per Section 17.5. A cross-repository test
+drives the real agent against the real control plane over HTTP.
+
+Two gates remain open before this is production-grade for managed hosts, and
+they are the current frontier (Section 24):
+
+- **Transport authentication is not yet enforced.** The agent presents a
+  one-time token at enrollment and is issued a certificate, but subsequent
+  session, heartbeat, and observation calls are authenticated only by the path
+  `node_id` plus session fencing — the issued certificate is not presented by
+  the client nor verified by the server. Managed-host mode MUST remain gated
+  (Decision 12) until mTLS is enforced end to end (Section 15.6).
+- **The gateway does not yet consume the serving projection.** Managed engines
+  reach `Ready` and are published by `meridian-control`, but the Meridian
+  gateway does not yet route to them. Until the projection is wired
+  (Section 24), managed engines are observable but do not receive application
+  traffic.
+
+Everything below describes the intended contract; where the current code does
+not yet meet it, the gap is called out at Sections 15.6 and 24.
 
 ## 2. Decision Summary
 
@@ -1172,6 +1201,37 @@ Logs include node/engine IDs, generation, operation ID, phase, status, reason,
 latency, and error class. They exclude prompts, completions, bearer tokens,
 private keys, model credentials, and unrestricted environment values.
 
+### 15.6 Enforcement status and the mTLS gate
+
+The identity model in Section 15.2 is the target. The current implementation
+issues real node certificates at enrollment but does **not** yet enforce mutual
+TLS on the ongoing control channel: after enrollment the agent does not present
+its certificate, and the control plane authorizes a request by the path
+`node_id` and the session/epoch/sequence fencing state alone. Session fencing
+prevents a stale or replayed agent session from mutating current state, but it
+does not by itself prevent an unauthenticated caller that knows a live
+`node_id` from issuing heartbeats or observations. This is acceptable only on a
+trusted private network for pre-production and dev.
+
+Closing this gate (the top item in Section 24) requires, end to end:
+
+1. **Client presents its certificate.** After enrollment the agent persists the
+   issued certificate and rebuilds its transport with the node key and cert, so
+   every session, heartbeat, desired-state, and observation call is an mTLS
+   call. The trust bundle from enrollment pins the CA.
+2. **Server verifies and binds identity.** mTLS terminates at the control plane
+   (or a reverse proxy that forwards the verified client certificate), and the
+   server rejects any request whose certificate SAN `node_id` does not equal the
+   path `node_id`, with `401 INVALID_CREDENTIAL`. This makes Section 8.1's
+   "a message is accepted only when its certificate maps to the path `node_id`"
+   an enforced check rather than a documented intent.
+3. **Rotation and revocation.** The agent rotates before certificate half-life
+   using its live session; the control plane publishes a short-lived revocation
+   deny-list checked on every heartbeat (the `revoked` flag exists server-side;
+   the deny-list surface and node-side rotation loop do not yet).
+
+Until all three hold, Decision 12 keeps managed-host mode gated.
+
 ## 16. Failure Semantics
 
 ### 16.1 Control-plane outage
@@ -1578,14 +1638,57 @@ later phases.
 - [ ] Contract tests run against a central Meridian test server. *(harness ready
       in `tests/test_compat.py`, gated on `MERIDIAN_COMPAT_URL`.)*
 
-## 24. Immediate Next Steps
+## 24. Next Steps
 
-1. Keep this RFC as the design baseline and resolve the open questions with a
-   design partner.
-2. Add `contracts/v1/` schemas and an OpenAPI document.
-3. Build a fake control-plane server used by agent contract tests.
-4. Implement local identity, durable state, heartbeat, and lease handling.
-5. Add a read-only NVIDIA inventory provider.
-6. Add a compatibility test target in the central Meridian repository.
-7. Do not add engine start/stop privileges until enrollment, fencing, and lease
-   expiry tests pass.
+Phases 0–3 and the `meridian-control` service are implemented and merged. The
+frontier below is ordered by what unblocks production, most important first.
+The original Phase 0 checklist (contracts, fake control plane, identity, lease
+handling, NVIDIA inventory, compatibility target) is complete.
+
+### P0 — Close the mTLS gate (unblocks managed-host production)
+
+This is the single blocker for Decision 12. See Section 15.6.
+
+1. Agent: persist the enrolled certificate; after enrollment rebuild the
+   transport with `cert=(node_cert, node_key)` and `verify=trust_bundle`, so
+   all post-enrollment calls are mTLS. Fix `wiring.build_agent` to do the
+   two-phase (token transport for enroll, cert transport for the session).
+2. Control plane: terminate mTLS (or accept a verified-client-cert header from a
+   trusted proxy) and add a dependency on every `/control/v1/nodes/{node_id}/*`
+   route that rejects a certificate whose SAN `node_id` differs from the path.
+3. Certificate rotation before half-life and a revocation deny-list checked on
+   every heartbeat. Add contract tests for cert/node mismatch and revoked-node
+   rejection.
+
+### P1 — Gateway consumes the serving projection (unblocks traffic)
+
+Managed engines reach `Ready` but receive no traffic until the gateway routes to
+them. Wire the Meridian gateway to consume `meridian-control`'s serving
+projection as a `managed` inventory provider (Section 17.3): merge managed
+endpoints into the routing registry with the static/observed/managed conflict
+rules, honor `routable`, and drop endpoints on lease expiry within the admission
+staleness bound. This is the one change that touches live gateway code and must
+be reviewed independently.
+
+### P2 — Phase 4 breadth
+
+- Generic OpenAI, Ollama, and SGLang drivers beyond the current vLLM + generic.
+- Kubernetes-integrated mode (report inventory; do not launch a second copy of a
+  cluster-scheduled engine).
+- Air-gapped signed bundles through the same digest/verification path.
+- Certificate rotation and revocation automation hardening beyond the P0 gate.
+
+### P3 — Phase 5 placement and capacity
+
+MIG parent/child constraints, VRAM reservations enforced at launch, artifact
+locality, and queue/capacity-aware assignment.
+
+### Cross-cutting hardening
+
+- `meridian-control`: replace `create_all` with Alembic migrations; add
+  connection pooling (and, beyond ~500 nodes, batched observation writes per
+  Section 10.7).
+- Real host tests on GPU hardware (NVML, MIG, Docker signal behavior,
+  disk-pressure and occupied-port paths) per Section 20.
+- Wire the `MERIDIAN_COMPAT_URL` compatibility target into CI against a
+  `meridian-control` instance.
