@@ -45,3 +45,8 @@ class Transport(Protocol):
     def post_observation(self, node_id: str, observation: dict) -> dict:
         """POST /control/v1/nodes/{node_id}/observations."""
         ...
+
+    def rotate_certificate(self, node_id: str) -> dict:
+        """POST /control/v1/nodes/{node_id}/certificate. Returns a fresh cert for
+        the node's registered public key (Phase 4 cert rotation)."""
+        ...
