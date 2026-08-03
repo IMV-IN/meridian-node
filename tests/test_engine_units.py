@@ -49,6 +49,38 @@ def test_driver_rejects_missing_device():
         driver.validate(a, [{"device_id": "some-other-gpu"}])
 
 
+@pytest.mark.parametrize("kind,params,expect_in_args", [
+    ("tgi", {"served_model_name": "m", "num_shard": 2}, ["--model-id", "/art", "--num-shard", "2"]),
+    ("sglang", {"served_model_name": "m", "tp_size": 4}, ["--model-path", "/art", "--tp", "4"]),
+    ("llamacpp", {"served_model_name": "m", "n_gpu_layers": 99}, ["-m", "/art", "-ngl", "99"]),
+    ("lmdeploy", {"served_model_name": "m", "tp": 2}, ["/art", "--tp", "2"]),
+])
+def test_openai_compatible_drivers(kind, params, expect_in_args):
+    driver = get_driver(kind)
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    a.engine.kind = kind
+    a.parameters = dict(params)
+    driver.validate(a, [{"device_id": "GPU-fake-0"}])
+    req = driver.build_launch(a, "/art", "node:engine:op")
+    for token in expect_in_args:
+        assert token in req.args, f"{token} missing from {req.args}"
+    assert str(a.resources.port) in req.args
+    assert req.env["NVIDIA_VISIBLE_DEVICES"] == "GPU-fake-0"
+    assert driver.readiness(a).served_model == "m"
+
+    a.parameters["nope"] = 1
+    with pytest.raises(DriverError, match="unknown engine parameters"):
+        driver.validate(a, [{"device_id": "GPU-fake-0"}])
+
+
+def test_openai_compatible_driver_requires_served_model():
+    a = make_assignment(manifest_digest="sha256:" + "1" * 64)
+    a.engine.kind = "tgi"
+    a.parameters = {}
+    with pytest.raises(DriverError, match="served_model_name"):
+        get_driver("tgi").validate(a, [{"device_id": "GPU-fake-0"}])
+
+
 def test_ollama_driver_build_launch_and_allowlist():
     driver = get_driver("ollama")
     a = make_assignment(manifest_digest="sha256:" + "1" * 64)

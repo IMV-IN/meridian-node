@@ -167,7 +167,124 @@ class OllamaDriver:
         return ReadinessSpec(path="/v1/models", served_model=str(assignment.parameters["served_model_name"]))
 
 
-_DRIVERS: dict[str, Driver] = {d.kind: d for d in (VllmDriver(), GenericOpenAIDriver(), OllamaDriver())}
+class _OpenAIServerDriver:
+    """Shared base for OpenAI-compatible engine servers (DESIGN.md 13). The engine
+    image's entrypoint is the server; the driver only supplies validated flags and
+    env — never a free-form command. Subclasses declare the kind, the parameter
+    allow-list, the flag mapping, and the readiness path."""
+
+    kind = ""
+    _ALLOWED: set[str] = {"served_model_name"}
+    _readiness_path = "/v1/models"
+
+    def validate(self, assignment: Assignment, gpus: list[dict]) -> None:
+        if assignment.engine.kind != self.kind:
+            raise DriverError(f"driver {self.kind} cannot handle engine kind {assignment.engine.kind}")
+        _check_params(assignment.parameters, self._ALLOWED)
+        if "served_model_name" not in assignment.parameters:
+            raise DriverError(f"{self.kind} requires served_model_name")
+        if not assignment.resources.device_ids:
+            raise DriverError(f"{self.kind} requires at least one GPU device")
+        _require_devices(assignment, gpus)
+
+    def _args(self, assignment: Assignment, artifact_path: str) -> list[str]:
+        raise NotImplementedError
+
+    def _env(self, assignment: Assignment) -> dict[str, str]:
+        return {"NVIDIA_VISIBLE_DEVICES": ",".join(assignment.resources.device_ids)}
+
+    def build_launch(self, assignment: Assignment, artifact_path: str, ownership_marker: str) -> LaunchRequest:
+        return LaunchRequest(
+            engine_id=assignment.engine_id,
+            image_digest=assignment.engine.image_digest,
+            args=tuple(self._args(assignment, artifact_path)),
+            env=self._env(assignment),
+            device_ids=tuple(assignment.resources.device_ids),
+            artifact_mount=artifact_path,
+            port=assignment.resources.port,
+            ownership_marker=ownership_marker,
+            memory_limit_bytes=assignment.resources.memory_limit_bytes,
+        )
+
+    def readiness(self, assignment: Assignment) -> ReadinessSpec:
+        return ReadinessSpec(path=self._readiness_path, served_model=str(assignment.parameters["served_model_name"]))
+
+
+class TgiDriver(_OpenAIServerDriver):
+    """HuggingFace Text Generation Inference (OpenAI-compatible since 1.4)."""
+
+    kind = "tgi"
+    _ALLOWED = {"served_model_name", "max_input_tokens", "max_total_tokens", "num_shard", "quantize", "dtype"}
+    _readiness_path = "/health"
+
+    def _args(self, assignment: Assignment, artifact_path: str) -> list[str]:
+        p = assignment.parameters
+        args = ["--model-id", artifact_path, "--hostname", "0.0.0.0", "--port", str(assignment.resources.port)]
+        for key, flag in (("num_shard", "--num-shard"), ("max_input_tokens", "--max-input-tokens"),
+                          ("max_total_tokens", "--max-total-tokens"), ("quantize", "--quantize"),
+                          ("dtype", "--dtype")):
+            if key in p:
+                args += [flag, str(p[key])]
+        return args
+
+
+class SglangDriver(_OpenAIServerDriver):
+    """SGLang server (`python -m sglang.launch_server`, OpenAI-compatible)."""
+
+    kind = "sglang"
+    _ALLOWED = {"served_model_name", "tp_size", "dtype", "context_length", "mem_fraction_static"}
+    _readiness_path = "/health"
+
+    def _args(self, assignment: Assignment, artifact_path: str) -> list[str]:
+        p = assignment.parameters
+        args = ["--model-path", artifact_path, "--host", "0.0.0.0", "--port", str(assignment.resources.port),
+                "--served-model-name", str(p["served_model_name"])]
+        for key, flag in (("tp_size", "--tp"), ("dtype", "--dtype"), ("context_length", "--context-length"),
+                          ("mem_fraction_static", "--mem-fraction-static")):
+            if key in p:
+                args += [flag, str(p[key])]
+        return args
+
+
+class LlamaCppDriver(_OpenAIServerDriver):
+    """llama.cpp server (`llama-server`, OpenAI-compatible /v1)."""
+
+    kind = "llamacpp"
+    _ALLOWED = {"served_model_name", "ctx_size", "n_gpu_layers", "parallel"}
+    _readiness_path = "/health"
+
+    def _args(self, assignment: Assignment, artifact_path: str) -> list[str]:
+        p = assignment.parameters
+        args = ["-m", artifact_path, "--host", "0.0.0.0", "--port", str(assignment.resources.port),
+                "--alias", str(p["served_model_name"])]
+        for key, flag in (("ctx_size", "-c"), ("n_gpu_layers", "-ngl"), ("parallel", "-np")):
+            if key in p:
+                args += [flag, str(p[key])]
+        return args
+
+
+class LmdeployDriver(_OpenAIServerDriver):
+    """LMDeploy (`lmdeploy serve api_server`, OpenAI-compatible)."""
+
+    kind = "lmdeploy"
+    _ALLOWED = {"served_model_name", "tp", "session_len", "cache_max_entry_count"}
+    _readiness_path = "/v1/models"
+
+    def _args(self, assignment: Assignment, artifact_path: str) -> list[str]:
+        p = assignment.parameters
+        args = [artifact_path, "--server-name", "0.0.0.0", "--server-port", str(assignment.resources.port),
+                "--model-name", str(p["served_model_name"])]
+        for key, flag in (("tp", "--tp"), ("session_len", "--session-len"),
+                          ("cache_max_entry_count", "--cache-max-entry-count")):
+            if key in p:
+                args += [flag, str(p[key])]
+        return args
+
+
+_DRIVERS: dict[str, Driver] = {d.kind: d for d in (
+    VllmDriver(), GenericOpenAIDriver(), OllamaDriver(),
+    TgiDriver(), SglangDriver(), LlamaCppDriver(), LmdeployDriver(),
+)}
 
 
 def get_driver(kind: str) -> Driver:
