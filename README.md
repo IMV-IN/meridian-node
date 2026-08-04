@@ -20,9 +20,9 @@ additional environments without granting them lifecycle-control privileges.
 The agent is implemented through Phases 0–5, with adapter seams (fakes in tests)
 at the hardware and network boundaries (NVML, Docker, mTLS HTTP) as the testing
 strategy prescribes. All four modes ship (observe-only, managed-host,
-kubernetes-integrated, air-gapped) and seven engine drivers. What remains needs a
-live fleet/hardware: running the gated GPU host tests on real NVIDIA hardware, and
-load-driven batched observation writes at fleet scale (connection pooling is in).
+kubernetes-integrated, air-gapped) and seven engine drivers. The gated GPU host
+tests are executed on an RTX 4060; the one remaining item is load-driven batched
+observation writes at fleet scale (connection pooling is in).
 
 | Area | State |
 |---|---|
@@ -34,6 +34,7 @@ load-driven batched observation writes at fleet scale (connection pooling is in)
 | Modes: observe-only, managed-host, kubernetes-integrated (read-only), air-gapped | Implemented + tested |
 | Placement: MIG + VRAM at launch; signals (locality/load/queue-depth/NVLink); control-side capacity-aware selection | Implemented + tested |
 | Hardening: cert rotation + revocation/CRL; Alembic migrations; GitHub Actions CI (incl. cross-repo) | Implemented + tested |
+| GPU host tests on real NVML (RTX 4060); DB connection pooling | Implemented + tested |
 | Supervisor, operation journal, reservation, reconciliation | Implemented + tested |
 | Root helper privilege boundary | Implemented + tested (protocol); Docker backend is host-tested |
 | **mTLS enforced end to end** (client cert presented + SAN bound to path) | Implemented + tested |

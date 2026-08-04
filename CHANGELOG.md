@@ -95,12 +95,15 @@ First implementation of the node agent, built against `DESIGN.md`.
 - **DB connection pooling:** non-SQLite engines get a sized, pre-pinged,
   recycling pool (`MERIDIAN_CONTROL_DB_POOL_SIZE` / `_MAX_OVERFLOW`).
 
-### Not yet included (needs a live fleet / GPU hardware)
-- Executing the gated GPU host tests on real NVIDIA hardware (the suite is written;
-  no GPU CI runner here).
+- **GPU host tests executed on real hardware (RTX 4060, driver 580):** the `gpu`
+  extra (`nvidia-ml-py`) + gated `test_host_gpu.py` cover the real `NvmlProvider`
+  and the real inventory flowing through a real agent → HTTP → control heartbeat.
+
+### Not yet included (needs a measured load profile)
 - Load-driven batched observation writes beyond ~500 nodes (Section 10.7);
   deliberately deferred — it trades read-freshness for throughput and should follow
   a measured load profile. Connection pooling is the first lever and is in place.
 
-Tests: 95 passing (+ 2 GPU host tests skipped, + 1 external compat); `ruff` and
-`mypy` clean. Cross-repo: gateway 540, control + cross-repo 41.
+Tests: 95 passing (+ 3 GPU host tests that pass with `MERIDIAN_GPU_HOST=1` on an
+RTX 4060, + 1 external compat skipped); `ruff` and `mypy` clean. Cross-repo:
+gateway 540, control + cross-repo 41.
