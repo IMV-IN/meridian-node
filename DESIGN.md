@@ -1,11 +1,12 @@
 # Meridian Node Agent Design
 
-**Status:** Implemented (Phases 0–4 complete; Phase 5 in progress). mTLS enforced
-end to end, gateway projection wired, connection verified with numbers (Sections
-1.1, 20, 24). Drivers: vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp,
-LMDeploy. Modes: observe-only, managed-host, kubernetes-integrated, air-gapped.
-Remaining: Phase-5 placement breadth (artifact locality, queue-aware assignment,
-NVLink affinity).
+**Status:** Implemented (Phases 0–5). mTLS enforced end to end with rotation +
+revocation/CRL, gateway projection wired, capacity-aware placement (locality,
+load, MIG, NVLink), Alembic-managed schema, cross-repo connection verified with
+numbers and in CI (Sections 1.1, 20, 24). Drivers: vLLM, Ollama, generic-OpenAI,
+TGI, SGLang, llama.cpp, LMDeploy. Modes: observe-only, managed-host,
+kubernetes-integrated, air-gapped. Remaining is operational: executing the GPU
+host tests on real hardware, queue-depth telemetry, connection pooling at scale.
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -47,9 +48,9 @@ use the host's native runtime where possible.
 
 ### 1.1 Implementation status
 
-As of 2026-08-04 the agent is implemented through Phases 0–4 (Phase 5 in
-progress), with adapter seams at the hardware and network boundaries (NVML,
-Docker, mTLS HTTP), fake-driven per the testing strategy in Section 20. All four
+As of 2026-08-04 the agent is implemented through Phases 0–5, with adapter seams
+at the hardware and network boundaries (NVML, Docker, mTLS HTTP), fake-driven per
+the testing strategy in Section 20. All four
 modes are implemented — observe-only, managed-host, kubernetes-integrated (Section
 6.3, read-only observation), and air-gapped (Section 6.4, signed bundles) — and
 seven engine drivers (vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp,
@@ -72,9 +73,12 @@ The two gates that previously blocked managed-host production are **closed**:
 
 The full `node ↔ control ↔ gateway` path is verified end to end with mTLS
 enforced, with measured numbers — see Section 20 ("End-to-end connection
-verification"). The remaining frontier (Section 24) is Phase-5 placement breadth
-(artifact locality, queue-depth-aware assignment, multi-GPU/NVLink affinity);
-MIG/VRAM enforcement at launch and capacity-aware node selection are done.
+verification"), and a dedicated control-plane CI job runs the cross-repo tests on
+every change. Phase 5 placement is in — capacity reporting, VRAM/MIG enforcement
+at launch, and control-side capacity-aware selection (artifact locality, load,
+NVLink affinity). What remains (Section 24) is operational rather than design:
+executing the GPU host tests on real hardware, queue-depth telemetry, and
+connection pooling at fleet scale.
 
 ## 2. Decision Summary
 
@@ -1751,9 +1755,12 @@ served `model` per ready engine so the projection can carry it.
   `KubernetesEngineObserver` reports cluster-scheduled engines on this node; the
   mode is structurally incapable of launching. **Phase 4 is now complete.**
 - ~~Certificate rotation~~ implemented (agent renews before half-life via
-  `POST /control/v1/nodes/{id}/certificate`); revocation deny-list hardening remains.
+  `POST /control/v1/nodes/{id}/certificate`).
+- ~~Revocation hardening~~ — revocation is enforced on every post-enrollment call
+  (not just session/heartbeat), and `GET /admin/crl` publishes revoked node ids +
+  cert serials for the TLS-terminating edge.
 
-### P3 — Phase 5 placement and capacity (in progress)
+### P3 — Phase 5 placement and capacity
 
 - ~~Capacity reporting~~ — the node reports authoritative allocatable VRAM + free
   ports per observation.
@@ -1761,18 +1768,23 @@ served `model` per ready engine so the projection can carry it.
   over-commit before launch.
 - ~~MIG parent/child constraints~~ — the ledger enforces physical/MIG-child
   exclusivity at launch, using the NVML-derived topology (`topology` map).
+- ~~Placement signals~~ — the node reports held artifacts, running-engine load,
+  and (operator-declared) NVLink groups.
 - ~~Capacity-aware assignment on the control side~~ — `meridian-control`'s
-  `select_placement` picks a routable node/device with enough reported allocatable
-  VRAM.
-- **Remaining:** artifact locality (prefer nodes that already cache the artifact),
-  queue-depth-aware assignment, and multi-GPU topology/NVLink affinity.
+  `select_placement` picks a routable node/device by artifact locality, then lower
+  load, then headroom, and for multi-GPU requests requires a shared NVLink group.
+- **Remaining (needs live hardware/telemetry):** queue-depth-aware assignment fed
+  by the gateway's live telemetry, and real multi-node NVLink topology discovery
+  via NVML on GPU hosts.
 
 ### Cross-cutting hardening
 
-- `meridian-control`: replace `create_all` with Alembic migrations; add
-  connection pooling (and, beyond ~500 nodes, batched observation writes per
-  Section 10.7).
-- Real host tests on GPU hardware (NVML, MIG, Docker signal behavior,
-  disk-pressure and occupied-port paths) per Section 20.
-- Wire the `MERIDIAN_COMPAT_URL` compatibility target into CI against a
-  `meridian-control` instance.
+- ~~Alembic migrations~~ — `meridian-control` manages the production schema with
+  Alembic (`meridian-control migrate`); `create_all` remains the dev/test default.
+- ~~Compatibility target in CI~~ — a dedicated control-plane CI job runs the
+  cross-repo node↔control tests; GitHub Actions lint/type/test both repos.
+- ~~GPU host-test scaffolding~~ — gated NVML host tests (`MERIDIAN_GPU_HOST`) that
+  run on real hardware.
+- **Remaining (operational):** connection pooling and, beyond ~500 nodes, batched
+  observation writes (Section 10.7); executing the GPU host tests on real
+  hardware.

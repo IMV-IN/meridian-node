@@ -17,10 +17,12 @@ additional environments without granting them lifecycle-control privileges.
 
 ## Status
 
-The agent is implemented through Phases 0–4 (Phase 5 in progress), with adapter
-seams (fakes in tests) at the hardware and network boundaries (NVML, Docker, mTLS
-HTTP) as the testing strategy prescribes. All four modes ship (observe-only,
-managed-host, kubernetes-integrated, air-gapped) and seven engine drivers.
+The agent is implemented through Phases 0–5, with adapter seams (fakes in tests)
+at the hardware and network boundaries (NVML, Docker, mTLS HTTP) as the testing
+strategy prescribes. All four modes ship (observe-only, managed-host,
+kubernetes-integrated, air-gapped) and seven engine drivers. What remains is
+operational: running the GPU host tests on real hardware, queue-depth telemetry,
+and connection pooling at fleet scale.
 
 | Area | State |
 |---|---|
@@ -30,7 +32,8 @@ managed-host, kubernetes-integrated, air-gapped) and seven engine drivers.
 | Artifact trust chain (signed manifest, digest, atomic promote, LRU) | Implemented + tested |
 | Engine drivers (vLLM, Ollama, generic-OpenAI, TGI, SGLang, llama.cpp, LMDeploy) | Implemented + tested |
 | Modes: observe-only, managed-host, kubernetes-integrated (read-only), air-gapped | Implemented + tested |
-| Placement: MIG parent/child + VRAM enforced at launch; control-side capacity-aware node selection | Implemented + tested |
+| Placement: MIG + VRAM at launch; signals (locality/load/NVLink); control-side capacity-aware selection | Implemented + tested |
+| Hardening: cert rotation + revocation/CRL; Alembic migrations; GitHub Actions CI (incl. cross-repo) | Implemented + tested |
 | Supervisor, operation journal, reservation, reconciliation | Implemented + tested |
 | Root helper privilege boundary | Implemented + tested (protocol); Docker backend is host-tested |
 | **mTLS enforced end to end** (client cert presented + SAN bound to path) | Implemented + tested |
@@ -59,7 +62,7 @@ and capacity-aware node selection are done.)
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[http,dev]"
-pytest -q                    # 92 tests
+pytest -q                    # 94 tests (+ GPU host tests, gated)
 ruff check src tests && mypy src/meridian_node
 
 # Validate a config and run one observe-only cycle against a control plane:

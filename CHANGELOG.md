@@ -79,11 +79,21 @@ First implementation of the node agent, built against `DESIGN.md`.
   in the reservation ledger; control-side `select_placement` capacity-aware node
   selection (`POST /admin/place`).
 
-### Not yet included
-- Phase-5 breadth: artifact locality, queue-depth-aware assignment, multi-GPU/
-  NVLink affinity.
-- Certificate **revocation** automation / CRL; Alembic migrations for
-  `meridian-control`; full host tests on GPU hardware.
+### Production hardening (completes Phases 0–5)
+- **All OpenAI-compatible engine drivers:** TGI, SGLang, llama.cpp, LMDeploy.
+- **Placement (Phase 5):** node reports held artifacts, engine load, and NVLink
+  groups; control-side `select_placement` chooses by artifact locality → load →
+  headroom, with NVLink-group affinity for multi-GPU requests.
+- **Revocation hardening:** enforced on every post-enrollment call; `GET /admin/crl`.
+- **Alembic migrations** manage the production schema (`meridian-control migrate`).
+- **CI:** GitHub Actions for both repos, including a control-plane job that runs
+  the cross-repo node↔control tests.
+- **GPU host-test scaffolding** gated on `MERIDIAN_GPU_HOST`.
 
-Tests: 92 passing (+ 1 skipped external compat); `ruff` and `mypy` clean.
-Cross-repo: gateway 540, control + cross-repo 31.
+### Not yet included (operational, needs hardware/scale)
+- Executing the GPU host tests on real NVIDIA hardware.
+- Queue-depth-aware assignment fed by the gateway's live telemetry.
+- Connection pooling and batched observation writes at fleet scale (Section 10.7).
+
+Tests: 94 passing (+ 2 GPU host tests skipped, + 1 external compat); `ruff` and
+`mypy` clean. Cross-repo: gateway 540, control + cross-repo 38.
