@@ -48,6 +48,7 @@ class EngineState:
     next_retry_at: Optional[datetime] = None
     reason: str = ""
     message: str = ""
+    queue_depth: Optional[int] = None  # live serving load, scraped while Ready (Phase 5)
 
     def condition(self, observed_at: datetime) -> dict:
         return {
@@ -82,6 +83,7 @@ class EngineSupervisor:
         fetcher,
         engine_host: str = "127.0.0.1",
         nvlink_groups: Optional[dict] = None,
+        telemetry_probe=None,
         now=_utcnow,
     ):
         self.node_id = node_id
@@ -95,6 +97,7 @@ class EngineSupervisor:
         self._fetcher = fetcher
         self.engine_host = engine_host
         self.nvlink_groups = nvlink_groups or {}
+        self.telemetry_probe = telemetry_probe
         self.now = now
         self.fencing_epoch = 0
         self._states: dict[str, EngineState] = {}
@@ -110,12 +113,14 @@ class EngineSupervisor:
         load-aware placement; NVLink groups for multi-GPU affinity."""
         reserved = self.reservations.reserved_ports()
         free_ports = sum(1 for p in self.reservations.port_range if p not in reserved)
-        running = sum(1 for st in self._states.values() if st.phase == EnginePhase.READY)
+        ready = [st for st in self._states.values() if st.phase == EnginePhase.READY]
+        queue_depth = sum(st.queue_depth for st in ready if st.queue_depth is not None)
         return {
             "allocatable_vram_bytes": self.reservations.allocatable(),
             "free_ports": free_ports,
             "held_artifacts": self.artifacts.held(),
-            "running_engines": running,
+            "running_engines": len(ready),
+            "queue_depth": queue_depth,
             "nvlink_groups": dict(self.nvlink_groups),
         }
 
@@ -158,6 +163,14 @@ class EngineSupervisor:
             if status is None or not status.alive:
                 self._fail(st, assignment, "ProcessExited", "engine process is not alive")
                 return st
+
+        # Scrape live serving load for placement (Phase 5). Best-effort: a failed
+        # probe leaves queue_depth unknown (None), never blocks reconciliation.
+        if st.phase == EnginePhase.READY and st.handle is not None and self.telemetry_probe is not None:
+            try:
+                st.queue_depth = self.telemetry_probe(self.engine_host, st.handle.port)
+            except Exception:
+                st.queue_depth = None
 
         desired = assignment.desired_phase
         if desired in (DesiredPhase.DRAINING, DesiredPhase.STOPPED):
