@@ -5,9 +5,9 @@ revocation/CRL, gateway projection wired, capacity-aware placement (locality,
 load, MIG, NVLink), Alembic-managed schema, cross-repo connection verified with
 numbers and in CI (Sections 1.1, 20, 24). Drivers: vLLM, Ollama, generic-OpenAI,
 TGI, SGLang, llama.cpp, LMDeploy. Modes: observe-only, managed-host,
-kubernetes-integrated, air-gapped. What remains needs a live fleet/hardware:
-executing the GPU host tests on real NVIDIA hardware, and load-driven batched
-observation writes at fleet scale (connection pooling is in place).
+kubernetes-integrated, air-gapped. The gated GPU host tests are executed on an
+RTX 4060. The one remaining item is load-driven batched observation writes at
+fleet scale (connection pooling is in place).
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -77,10 +77,10 @@ enforced, with measured numbers — see Section 20 ("End-to-end connection
 verification"), and a dedicated control-plane CI job runs the cross-repo tests on
 every change. Phase 5 placement is in — capacity reporting, VRAM/MIG enforcement
 at launch, and control-side capacity-aware selection (artifact locality,
-queue-depth-aware load, NVLink affinity). What remains (Section 24) is operational
-rather than design: executing the gated GPU host tests on real NVIDIA hardware,
-and load-driven batched observation writes at fleet scale (connection pooling is
-in place).
+queue-depth-aware load, NVLink affinity). The gated GPU host tests have been
+executed on an RTX 4060. What remains (Section 24) is one operational item —
+load-driven batched observation writes at fleet scale (connection pooling is in
+place).
 
 ## 2. Decision Summary
 
@@ -1587,7 +1587,13 @@ control + cross-repo **29**; ruff + mypy clean across all three.
 
 ### Host tests
 
-- NVIDIA host with one GPU.
+Gated behind `MERIDIAN_GPU_HOST` (the `gpu` extra installs `nvidia-ml-py`).
+`tests/test_host_gpu.py` is **executed and passing on an NVIDIA RTX 4060** — it
+covers the real `NvmlProvider` device fields + MIG-parent linkage, digest
+stability, and the real GPU inventory flowing through a real agent → HTTP →
+control heartbeat. The broader matrix below runs where the hardware exists:
+
+- NVIDIA host with one GPU (RTX 4060, verified).
 - NVIDIA host with multiple GPUs.
 - MIG fixture where available.
 - Insufficient VRAM, unavailable device, occupied port, and disk pressure.
@@ -1787,14 +1793,14 @@ served `model` per ready engine so the projection can carry it.
   Alembic (`meridian-control migrate`); `create_all` remains the dev/test default.
 - ~~Compatibility target in CI~~ — a dedicated control-plane CI job runs the
   cross-repo node↔control tests; GitHub Actions lint/type/test both repos.
-- ~~GPU host-test scaffolding~~ — gated NVML host tests (`MERIDIAN_GPU_HOST`) that
-  run on real hardware.
+- ~~GPU host tests~~ — gated NVML host tests (`MERIDIAN_GPU_HOST`, the `gpu`
+  extra) **executed and passing on an NVIDIA RTX 4060** (driver 580): the real
+  `NvmlProvider` inventory, digest stability, and the real inventory flowing
+  through a real agent → HTTP → control heartbeat.
 - ~~Connection pooling~~ — non-SQLite engines get a sized, pre-pinged, recycling
   pool (`MERIDIAN_CONTROL_DB_POOL_SIZE` / `_MAX_OVERFLOW`).
-- **Remaining (needs a live fleet / hardware):**
-  - *Executing* the gated GPU host tests on real NVIDIA hardware — the suite is
-    written; this repo's CI has no GPU runner.
-  - *Batched* observation writes beyond ~500 nodes (Section 10.7). Deferred
-    deliberately: batching trades projection/placement read-freshness for write
-    throughput, so it should be driven by a measured load profile rather than
-    guessed. Connection pooling is the correct first lever and is in place.
+- **Remaining (needs a measured load profile):** *batched* observation writes
+  beyond ~500 nodes (Section 10.7). Deferred deliberately — batching trades
+  projection/placement read-freshness for write throughput, so it should follow a
+  measured load profile rather than a guess. Connection pooling is the correct
+  first lever and is in place.

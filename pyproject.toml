@@ -26,6 +26,11 @@ http = [
 k8s = [
     "kubernetes",
 ]
+# Real NVML inventory on an NVIDIA host (NvmlProvider). Tests fall back to the
+# fake provider; this is only needed to read a real GPU.
+gpu = [
+    "nvidia-ml-py",
+]
 dev = [
     "ruff",
     "mypy",
