@@ -90,10 +90,17 @@ First implementation of the node agent, built against `DESIGN.md`.
   the cross-repo node↔control tests.
 - **GPU host-test scaffolding** gated on `MERIDIAN_GPU_HOST`.
 
-### Not yet included (operational, needs hardware/scale)
-- Executing the GPU host tests on real NVIDIA hardware.
-- Queue-depth-aware assignment fed by the gateway's live telemetry.
-- Connection pooling and batched observation writes at fleet scale (Section 10.7).
+- **Queue-depth-aware placement:** the node scrapes live queue depth per Ready
+  engine; control-side `select_placement` uses it as the load metric.
+- **DB connection pooling:** non-SQLite engines get a sized, pre-pinged,
+  recycling pool (`MERIDIAN_CONTROL_DB_POOL_SIZE` / `_MAX_OVERFLOW`).
 
-Tests: 94 passing (+ 2 GPU host tests skipped, + 1 external compat); `ruff` and
-`mypy` clean. Cross-repo: gateway 540, control + cross-repo 38.
+### Not yet included (needs a live fleet / GPU hardware)
+- Executing the gated GPU host tests on real NVIDIA hardware (the suite is written;
+  no GPU CI runner here).
+- Load-driven batched observation writes beyond ~500 nodes (Section 10.7);
+  deliberately deferred — it trades read-freshness for throughput and should follow
+  a measured load profile. Connection pooling is the first lever and is in place.
+
+Tests: 95 passing (+ 2 GPU host tests skipped, + 1 external compat); `ruff` and
+`mypy` clean. Cross-repo: gateway 540, control + cross-repo 41.

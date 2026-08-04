@@ -5,8 +5,9 @@ revocation/CRL, gateway projection wired, capacity-aware placement (locality,
 load, MIG, NVLink), Alembic-managed schema, cross-repo connection verified with
 numbers and in CI (Sections 1.1, 20, 24). Drivers: vLLM, Ollama, generic-OpenAI,
 TGI, SGLang, llama.cpp, LMDeploy. Modes: observe-only, managed-host,
-kubernetes-integrated, air-gapped. Remaining is operational: executing the GPU
-host tests on real hardware, queue-depth telemetry, connection pooling at scale.
+kubernetes-integrated, air-gapped. What remains needs a live fleet/hardware:
+executing the GPU host tests on real NVIDIA hardware, and load-driven batched
+observation writes at fleet scale (connection pooling is in place).
 
 **Repository:** `IMV-IN/meridian-node`
 
@@ -75,10 +76,11 @@ The full `node ↔ control ↔ gateway` path is verified end to end with mTLS
 enforced, with measured numbers — see Section 20 ("End-to-end connection
 verification"), and a dedicated control-plane CI job runs the cross-repo tests on
 every change. Phase 5 placement is in — capacity reporting, VRAM/MIG enforcement
-at launch, and control-side capacity-aware selection (artifact locality, load,
-NVLink affinity). What remains (Section 24) is operational rather than design:
-executing the GPU host tests on real hardware, queue-depth telemetry, and
-connection pooling at fleet scale.
+at launch, and control-side capacity-aware selection (artifact locality,
+queue-depth-aware load, NVLink affinity). What remains (Section 24) is operational
+rather than design: executing the gated GPU host tests on real NVIDIA hardware,
+and load-driven batched observation writes at fleet scale (connection pooling is
+in place).
 
 ## 2. Decision Summary
 
@@ -1769,13 +1771,15 @@ served `model` per ready engine so the projection can carry it.
 - ~~MIG parent/child constraints~~ — the ledger enforces physical/MIG-child
   exclusivity at launch, using the NVML-derived topology (`topology` map).
 - ~~Placement signals~~ — the node reports held artifacts, running-engine load,
-  and (operator-declared) NVLink groups.
+  live queue depth (scraped from the engine's metrics), and (operator-declared)
+  NVLink groups.
 - ~~Capacity-aware assignment on the control side~~ — `meridian-control`'s
   `select_placement` picks a routable node/device by artifact locality, then lower
-  load, then headroom, and for multi-GPU requests requires a shared NVLink group.
-- **Remaining (needs live hardware/telemetry):** queue-depth-aware assignment fed
-  by the gateway's live telemetry, and real multi-node NVLink topology discovery
-  via NVML on GPU hosts.
+  **queue depth** (falling back to engine count), then headroom, and for multi-GPU
+  requests requires a shared NVLink group.
+- **Remaining (needs GPU hardware):** real multi-node NVLink topology *discovery*
+  via NVML (operators declare groups today); validating the queue-depth scrape
+  against real engine metric formats.
 
 ### Cross-cutting hardening
 
@@ -1785,6 +1789,12 @@ served `model` per ready engine so the projection can carry it.
   cross-repo node↔control tests; GitHub Actions lint/type/test both repos.
 - ~~GPU host-test scaffolding~~ — gated NVML host tests (`MERIDIAN_GPU_HOST`) that
   run on real hardware.
-- **Remaining (operational):** connection pooling and, beyond ~500 nodes, batched
-  observation writes (Section 10.7); executing the GPU host tests on real
-  hardware.
+- ~~Connection pooling~~ — non-SQLite engines get a sized, pre-pinged, recycling
+  pool (`MERIDIAN_CONTROL_DB_POOL_SIZE` / `_MAX_OVERFLOW`).
+- **Remaining (needs a live fleet / hardware):**
+  - *Executing* the gated GPU host tests on real NVIDIA hardware — the suite is
+    written; this repo's CI has no GPU runner.
+  - *Batched* observation writes beyond ~500 nodes (Section 10.7). Deferred
+    deliberately: batching trades projection/placement read-freshness for write
+    throughput, so it should be driven by a measured load profile rather than
+    guessed. Connection pooling is the correct first lever and is in place.
