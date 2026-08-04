@@ -82,6 +82,7 @@ class Reconciler:
                 "endpoint": endpoint,
                 # Model the gateway routes on; operators may override via parameters.
                 "model": assignment.parameters.get("model") or assignment.artifact.artifact_id,
+                "queue_depth": st.queue_depth,
                 "conditions": [st.condition(now)],
             })
         orphan_conditions = [

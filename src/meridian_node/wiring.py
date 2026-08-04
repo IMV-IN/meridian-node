@@ -137,6 +137,7 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
         fetcher=fetcher,
         engine_host=policy.engine_host,
         nvlink_groups=policy.device_nvlink_groups,
+        telemetry_probe=_build_telemetry_probe(),
         **sup_kwargs,
     )
     reconciler = Reconciler(node_id, supervisor, agent.state, **sup_kwargs)
@@ -156,6 +157,30 @@ def _build_runtime(config: Config, agent: Agent):
 
     send = unix_socket_send(config.policy.helper_socket_path)
     return HelperRuntime(send, session_id=agent.session_id, fencing_epoch=agent.fencing_epoch)
+
+
+def _build_telemetry_probe():
+    """Best-effort live queue-depth scrape from an engine's Prometheus /metrics
+    (Phase 5 placement). Reads the vLLM-style `num_requests_waiting` gauge; other
+    OpenAI-compatible servers expose a similar counter. Returns None on any
+    failure so placement degrades to the running-engine count."""
+    import httpx
+
+    def probe(host: str, port: int) -> "int | None":
+        try:
+            r = httpx.get(f"http://{host}:{port}/metrics", timeout=1.0)
+            if r.status_code != 200:
+                return None
+            for line in r.text.splitlines():
+                if line.startswith("#"):
+                    continue
+                if "num_requests_waiting" in line or "queue" in line.split("{")[0]:
+                    return int(float(line.rsplit(" ", 1)[-1]))
+        except (httpx.HTTPError, ValueError, IndexError):
+            return None
+        return None
+
+    return probe
 
 
 def _build_prober():

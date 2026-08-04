@@ -202,10 +202,32 @@ def test_capacity_report_includes_placement_signals(tmp_path):
     sup.nvlink_groups = {"GPU-0": "nv0", "GPU-1": "nv0"}
     rep = sup.capacity_report()
     assert set(rep) >= {"allocatable_vram_bytes", "free_ports", "held_artifacts",
-                        "running_engines", "nvlink_groups"}
+                        "running_engines", "queue_depth", "nvlink_groups"}
     assert rep["running_engines"] == 0
+    assert rep["queue_depth"] == 0
     assert rep["held_artifacts"] == []
     assert rep["nvlink_groups"] == {"GPU-0": "nv0", "GPU-1": "nv0"}
+
+
+def test_capacity_report_aggregates_queue_depth(tmp_path):
+    from datetime import datetime, timezone
+
+    from engine_helpers import build_supervisor
+
+    from meridian_node.models import EnginePhase
+    from meridian_node.runtime import FakeRuntime
+
+    manifest, digest, keys, _ = make_signed_manifest(tmp_path / "src", {"m.bin": b"w"})
+    sup = build_supervisor(tmp_path, FakeRuntime(), manifest, keys, tmp_path / "src",
+                           lambda: datetime.now(timezone.utc))
+    for eid, depth in (("e1", 3), ("e2", 5)):
+        st = sup.state(eid)
+        st.phase = EnginePhase.READY
+        st.queue_depth = depth
+    sup.state("e3").phase = EnginePhase.READY  # queue_depth unknown -> treated as 0
+    rep = sup.capacity_report()
+    assert rep["running_engines"] == 3
+    assert rep["queue_depth"] == 8
 
 
 def test_artifact_store_held_lists_materialized(tmp_path):
