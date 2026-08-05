@@ -54,6 +54,23 @@ A runnable dev/reference control plane (`meridian-node-devserver`) implements th
 v1 wire protocol so the real HTTP transport and the managed loop can be driven
 end to end (`tests/test_live_server.py`) without the production service.
 
+## Production readiness
+
+Feature-complete and tested (Phases 0–5). Deploy the agent from `deploy/`
+(systemd units for the non-root agent + root helper, a Dockerfile, and example
+configs). Before a production rollout, follow the checklist — enable mTLS
+(`require_mtls` is off by default), pin image digests + trusted signing keys in
+the root-owned policy, start `observe-only` before `managed-host`, and run
+`meridian-control` on Postgres with the CA persisted. The full checklist and the
+control-plane/agent deployment flow live in the Meridian repo's
+[Control plane & node agents](https://github.com/IMV-IN/Meridian/blob/main/docs/CONTROL_PLANE.md)
+doc.
+
+**What's left** is one deliberately deferred item: load-driven **batched
+observation writes** beyond ~500 nodes (DESIGN.md §10.7, §24) — it trades
+projection read-freshness for write throughput and should follow a measured load
+profile. Connection pooling is the first lever and is in place.
+
 Remaining frontier: Phase-5 placement breadth — artifact locality, queue-depth-
 aware assignment, and multi-GPU/NVLink affinity. (MIG/VRAM enforcement at launch
 and capacity-aware node selection are done.)
