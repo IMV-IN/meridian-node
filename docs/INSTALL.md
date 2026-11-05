@@ -6,6 +6,10 @@ after the security gates in [SECURITY.md](SECURITY.md) are met.
 
 ## From source
 
+Requires **Python 3.11 or newer**; **3.14 is recommended** (the image and CI run
+on it). On hosts whose system Python is older (e.g. Ubuntu 22.04 ships 3.10),
+install 3.14 with `uv python install 3.14` or your distribution's packages.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[http,dev]"

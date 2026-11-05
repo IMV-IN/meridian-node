@@ -8,11 +8,17 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # From the oldest supported Python (requires-python; 3.10 reached end
+        # of life in October 2026) up to 3.14, the version everything runs on.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install
         run: pip install -e ".[http,dev]"
       - name: Lint
