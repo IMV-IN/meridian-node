@@ -2,6 +2,11 @@
 
 ## 0.1.0 (unreleased)
 
+- **Python 3.14 everywhere.** The agent image moves to
+  `python:3.14-slim-trixie` and `.python-version` pins 3.14 for local
+  development. Supported range is now **3.11 – 3.14**
+  (`requires-python >= 3.11`, all tested in CI); 3.10 is end-of-life upstream.
+
 First implementation of the node agent, built against `DESIGN.md`.
 
 ### Contracts and safety foundation (Phase 0)

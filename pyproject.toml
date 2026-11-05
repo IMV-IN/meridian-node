@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Host-local agent for GPU inference servers managed by central Meridian"
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0",
     "pyyaml",
@@ -47,14 +47,15 @@ meridian-node-devserver = "meridian_node.devserver:main"
 packages = ["src/meridian_node"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
 [tool.mypy]
-python_version = "3.10"
+# Check against the oldest supported Python (requires-python).
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

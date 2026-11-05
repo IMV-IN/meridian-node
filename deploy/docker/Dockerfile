@@ -1,7 +1,8 @@
 # Non-root agent image. Observe-only by default; managed-host mode additionally
 # requires the root helper (run on the host, not in this container) and a
 # root-owned policy file. See DESIGN.md 6.5 and 14.1.
-FROM python:3.12-slim
+# Python 3.14 is the project's runtime everywhere (image, CI, local dev).
+FROM python:3.14-slim-trixie
 
 RUN useradd --system --uid 10001 --create-home meridian-node
 WORKDIR /app
