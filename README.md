@@ -54,6 +54,10 @@ A runnable dev/reference control plane (`meridian-node-devserver`) implements th
 v1 wire protocol so the real HTTP transport and the managed loop can be driven
 end to end (`tests/test_live_server.py`) without the production service.
 
+## Batch jobs and services
+
+With `policy.jobs_enabled: true` the agent also runs digest-pinned containers as batch jobs or long-running services, each holding its GPUs exclusively and launched at most once. This is what Meridian Compute (marketplace and training jobs) schedules onto a node. See `DESIGN.md` section 25 and `deploy/config.managed-host.example.yaml`.
+
 ## Production readiness
 
 Feature-complete and tested (Phases 0–5). Deploy the agent from `deploy/`

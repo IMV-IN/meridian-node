@@ -9,16 +9,60 @@
       "generation": 42,
       "spec_revision": 1,
       "desired_phase": "Running",
-      "engine": {"kind": "vllm", "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "version": "0.10.2"},
+      "engine": {
+        "kind": "vllm",
+        "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "version": "0.10.2"
+      },
       "artifact": {
         "artifact_id": "artifact_qwen25_05b",
         "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
         "manifest_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "engine_image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       },
-      "resources": {"device_ids": ["GPU-fake-0"], "memory_limit_bytes": 7516192768, "port": 8000},
-      "parameters": {"served_model_name": "Qwen/Qwen2.5-0.5B-Instruct", "max_model_len": 4096},
-      "policy": {"restart": {"max_attempts": 5, "backoff_seconds": 30}, "drain_timeout_seconds": 120}
+      "resources": {
+        "device_ids": [
+          "GPU-fake-0"
+        ],
+        "memory_limit_bytes": 7516192768,
+        "port": 8000
+      },
+      "parameters": {
+        "served_model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+        "max_model_len": 4096
+      },
+      "policy": {
+        "restart": {
+          "max_attempts": 5,
+          "backoff_seconds": 30
+        },
+        "drain_timeout_seconds": 120
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "job_01J000000000000000000000",
+      "replica": 0,
+      "kind": "job",
+      "image": "docker.io/pytorch/pytorch@sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "args": [
+        "python",
+        "train.py",
+        "--epochs",
+        "3"
+      ],
+      "env": {
+        "MERIDIAN_JOB_RANK": "0",
+        "MERIDIAN_JOB_REPLICAS": "2"
+      },
+      "device_ids": [
+        "GPU-fake-1"
+      ],
+      "memory_limit_bytes": 0,
+      "port": 9000,
+      "timeout_seconds": 3600,
+      "desired_phase": "Running"
     }
   ]
 }

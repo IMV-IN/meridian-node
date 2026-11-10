@@ -39,7 +39,8 @@ class Journal:
     def __init__(self, db_path: str | Path):
         p = Path(db_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(p), isolation_level=None)
+        # The helper serves one connection per thread and serializes journal access with its own lock.
+        self._conn = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(

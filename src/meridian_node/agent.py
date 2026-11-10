@@ -219,11 +219,20 @@ class Agent:
 
         if self._cached_snapshot is not None:
             snapshot = DesiredSnapshot(**self._cached_snapshot)
-            stop_authorized = set(resp.get("stop_authorized_engine_ids", []))
-            observation = self.reconciler.apply(snapshot, stop_authorized=stop_authorized)
-            observation["agent_session_id"] = self.session_id
-            observation["sequence"] = self.state.last_sequence()
-            self.transport.post_observation(self.node_id, observation)
+        elif self.state.accepted_generation() == 0:
+            # Nothing has ever been published for this node. Reconcile an empty
+            # snapshot anyway so the control plane learns the node's capacity:
+            # placement and marketplace listings need it before the first
+            # assignment can exist.
+            assert self.node_id is not None
+            snapshot = DesiredSnapshot(node_id=self.node_id, generation=0, snapshot_hash="sha256:" + "0" * 64)
+        else:
+            return resp
+        stop_authorized = set(resp.get("stop_authorized_engine_ids", []))
+        observation = self.reconciler.apply(snapshot, stop_authorized=stop_authorized)
+        observation["agent_session_id"] = self.session_id
+        observation["sequence"] = self.state.last_sequence()
+        self.transport.post_observation(self.node_id, observation)
         return resp
 
     def _report_observed_engines(self, desired_generation: int) -> None:

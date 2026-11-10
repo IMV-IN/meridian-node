@@ -74,3 +74,37 @@ def test_observe_only_cannot_attach_reconciler(tmp_path, clock_factory):
     import pytest
     with pytest.raises(ValueError, match="engine-launching mode"):
         agent.attach_reconciler(object())
+
+
+def test_fresh_node_reports_capacity_before_any_assignment_and_then_runs_a_job(tmp_path, clock_factory):
+    """Placement and marketplace listings need a node's capacity before anything
+    has been published for it, and the first thing published may be a job."""
+    from meridian_node.jobs import JobPolicy, JobSupervisor
+    from meridian_node.models import JobAssignment
+
+    clock = clock_factory()
+    fake = FakeControlPlane({"auto": Token(auto_approve=True)}, now=clock, lease_ttl_seconds=30)
+    agent = Agent(Config(control_plane_url="fake://cp", state_dir=tmp_path, mode="managed-host"),
+                  fake.presenting("auto"), now=clock)
+    node_id = agent.ensure_enrolled()
+    agent.establish_session()
+    runtime = FakeRuntime()
+    manifest, _, keys, _ = make_signed_manifest(tmp_path / "src", {"model.bin": b"w"})
+    sup = build_supervisor(tmp_path, runtime, manifest, keys, tmp_path / "src", clock, node_id=node_id)
+    sup.reservations.job_port_range = range(9000, 9010)
+    jobs = JobSupervisor(node_id, runtime, sup.journal, sup.reservations,
+                         JobPolicy(enabled=True, allow_any_image=True), "10.0.0.5", now=clock)
+    agent.attach_reconciler(Reconciler(node_id, sup, agent.state, now=clock, jobs=jobs))
+
+    agent.tick()  # nothing published yet
+    cap = fake.observations[node_id]["capacity"]
+    device = cap["free_devices"][0]
+    assert cap["jobs_enabled"] is True and cap["job_port_range"] == [9000, 9010]
+    assert fake.observations[node_id]["observed_generation"] == 0
+
+    job = JobAssignment(job_id="job_1", image="docker.io/library/alpine@sha256:" + "c" * 64, device_ids=[device])
+    snap = DesiredSnapshot(node_id=node_id, generation=1, snapshot_hash="sha256:" + "0" * 64, jobs=[job])
+    fake.set_desired(node_id, snap.model_dump(mode="json"))
+    agent.tick()
+    obs = fake.observations[node_id]
+    assert obs["jobs"][0]["phase"] == "Running" and device not in obs["capacity"]["free_devices"]

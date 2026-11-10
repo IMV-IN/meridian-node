@@ -38,12 +38,25 @@ class Policy(BaseModel):
     device_nvlink_groups: dict[str, str] = Field(default_factory=dict)
     engine_host: str = "127.0.0.1"
     helper_socket_path: str = "/run/meridian-node/helper.sock"
+    # --- batch jobs and services (DESIGN.md 25) -------------------------
+    # Off by default. A job runs a tenant-supplied, digest-pinned container
+    # image with its own arguments, so the host owner opts in here.
+    jobs_enabled: bool = False
+    # Image digests jobs may run. Ignored when job_allow_any_image is true.
+    allowed_job_image_digests: list[str] = Field(default_factory=list)
+    # Accept any digest-pinned image (a marketplace host renting whole GPUs).
+    # allowed_job_registries still applies when it is non-empty.
+    job_allow_any_image: bool = False
+    allowed_job_registries: list[str] = Field(default_factory=list)
+    job_port_range: list[int] = Field(default=[9000, 9100])  # [start, stop)
+    # Hard ceiling on one job's runtime on this host; 0 = no host-side ceiling.
+    job_max_runtime_seconds: int = Field(default=0, ge=0)
 
-    @field_validator("port_range")
+    @field_validator("port_range", "job_port_range")
     @classmethod
     def _valid_range(cls, v: list[int]) -> list[int]:
         if len(v) != 2 or v[0] >= v[1]:
-            raise ValueError(f"port_range must be [start, stop) with start < stop, got {v}")
+            raise ValueError(f"port ranges must be [start, stop) with start < stop, got {v}")
         return v
 
 
@@ -111,6 +124,10 @@ class Config(BaseModel):
         elif not self.control_plane_url:
             raise ValueError("control_plane_url is required")
         return self
+
+    def jobs_allowed(self) -> bool:
+        """Jobs need managed lifecycle control plus the separate jobs switch."""
+        return self.managed_allowed() and self.policy.jobs_enabled
 
     def managed_allowed(self) -> bool:
         """Managed lifecycle requires an engine-launching mode plus the local

@@ -32,6 +32,9 @@ class ReservationLedger:
     # MIG topology: device_id -> parent physical GPU (None for a physical GPU).
     # Enables MIG parent/child exclusivity at launch (DESIGN.md 6.5, Phase 5).
     topology: dict[str, Optional[str]] = field(default_factory=dict)
+    # Ports jobs may publish; separate from the engine range so a job can never
+    # take an engine's port.
+    job_port_range: range = range(0)
     _by_engine: dict[str, _Reservation] = field(default_factory=dict)
 
     def _mig_conflict(self, device_ids: list[str]) -> Optional[str]:
@@ -79,6 +82,42 @@ class ReservationLedger:
         # All checks passed; commit as one unit.
         self._by_engine[engine_id] = _Reservation(engine_id, tuple(device_ids), gpu_memory_bytes, port)
 
+    def reserve_exclusive(self, owner_id: str, device_ids: list[str], port: int = 0) -> None:
+        """Reserve whole devices for a job replica (DESIGN.md 25). A job gets its
+        GPUs exclusively: any existing reservation on a device rejects it, and
+        while it is held the device reports zero allocatable VRAM. `port` 0
+        means the job publishes no port."""
+        existing = self._by_engine.get(owner_id)
+        if existing is not None:
+            if existing.device_ids == tuple(device_ids) and existing.port == port:
+                return
+            raise ReservationError(f"{owner_id} already holds a different reservation")
+        if port:
+            if not (self.job_port_range.start <= port < self.job_port_range.stop):
+                raise ReservationError(f"port {port} outside the job port range {self.job_port_range}")
+            if port in self.reserved_ports():
+                raise ReservationError(f"port {port} already reserved")
+        for dev in device_ids:
+            if dev not in self.device_capacity:
+                raise ReservationError(f"unknown device {dev}")
+            holder = next((r.engine_id for r in self._by_engine.values() if dev in r.device_ids), None)
+            if holder is not None:
+                raise ReservationError(f"device {dev} is in use by {holder}")
+        conflict = self._mig_conflict(device_ids)
+        if conflict:
+            raise ReservationError(conflict)
+        budget = max((self.device_capacity[d] for d in device_ids), default=0)
+        self._by_engine[owner_id] = _Reservation(owner_id, tuple(device_ids), budget, port)
+
+    def free_devices(self) -> list[str]:
+        """Devices nothing holds: what a job, which needs a whole GPU, can take."""
+        held = {d for r in self._by_engine.values() for d in r.device_ids}
+        return sorted(d for d in self.device_capacity if d not in held)
+
+    def free_job_ports(self) -> int:
+        reserved = self.reserved_ports()
+        return sum(1 for p in self.job_port_range if p not in reserved)
+
     def release(self, engine_id: str) -> None:
         self._by_engine.pop(engine_id, None)
 
@@ -96,4 +135,4 @@ class ReservationLedger:
         return out
 
     def reserved_ports(self) -> set[int]:
-        return {r.port for r in self._by_engine.values()}
+        return {r.port for r in self._by_engine.values() if r.port}
