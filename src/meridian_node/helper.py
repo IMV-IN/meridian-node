@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Protocol
 
 from .journal import COMMITTED, Journal
+from .models import DEVICE_ID, IMAGE_REF, JOB_ID, MAX_IMAGE_REF, job_strings_error
 
 
 class HelperError(Exception):
@@ -43,9 +46,19 @@ class HelperPolicy:
     allowed_job_registries: frozenset[str] = frozenset()
     job_port_start: int = 0
     job_port_stop: int = 0
+    # Job container limits (DESIGN.md 25.3). The helper applies these itself;
+    # the agent cannot send them.
+    job_bind_address: str = "127.0.0.1"  # IP literal published job ports bind to
+    job_memory_default_bytes: int = 32 * 1024**3  # cap for a job that asks for none
+    job_memory_max_bytes: int = 256 * 1024**3  # largest cap a job may ask for
+    job_cpus: float = 0.0  # 0 = no CPU limit
 
 
 class ContainerBackend(Protocol):
+    # Grammar of the runtime ids this backend hands out. Every id the agent
+    # sends back is checked against it before it reaches the backend.
+    RUNTIME_ID: re.Pattern[str]
+
     def launch(self, spec: dict) -> str: ...
     def inspect(self, runtime_id: str) -> Optional[dict]: ...
     def stop(self, runtime_id: str, force_after_seconds: int) -> None: ...
@@ -55,11 +68,33 @@ class ContainerBackend(Protocol):
     def remove(self, runtime_id: str) -> None: ...
 
 
-_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-MAX_JOB_ARGS = 256
-MAX_JOB_ENV = 128
-MAX_JOB_STRING = 8192
 MAX_LOG_BYTES = 65536
+MAX_NONCES = 65536  # replay window; older nonces are forgotten first
+# Every field a launch_job request may carry. Anything else is refused, so a
+# new host-access knob can never be smuggled in under a name the helper ignores.
+JOB_FIELDS = frozenset({
+    "engine_id", "job_key", "image", "args", "env", "device_ids", "port", "memory_limit_bytes", "ownership_marker",
+})
+# "<node_id>:<job_key>:<operation_id>", written into a container label.
+OWNERSHIP_MARKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}")
+# A bind-mount source: no comma, quote, colon or '=', so it stays one field of `--mount`.
+MOUNT_PATH = re.compile(r"/[A-Za-z0-9._/+-]{1,4095}")
+
+
+def gpu_env(device_ids: list[str]) -> dict[str, str]:
+    """GPU visibility the helper sets for every job container, after the job's
+    own env, so neither the job nor its image's ENV can widen it (H4). With no
+    devices, `void` denies GPUs even where the host's default runtime is
+    nvidia and honours this variable."""
+    if device_ids:
+        return {
+            "NVIDIA_VISIBLE_DEVICES": ",".join(device_ids),
+            "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            "CUDA_VISIBLE_DEVICES": ",".join(str(i) for i in range(len(device_ids))),
+        }
+    return {
+        "NVIDIA_VISIBLE_DEVICES": "void", "NVIDIA_DRIVER_CAPABILITIES": "compute,utility", "CUDA_VISIBLE_DEVICES": "",
+    }
 
 
 def _digest(payload: dict) -> str:
@@ -72,7 +107,7 @@ class HelperServer:
         self.journal = journal
         self.policy = policy
         self.highest_epoch = 0
-        self._seen_nonces: set[str] = set()
+        self._seen_nonces: dict[str, None] = {}  # insertion-ordered, bounded by MAX_NONCES
         # Connections are served on separate threads. The lock guards the journal and nonce set; it is
         # never held across a backend call, since `docker run` can block for minutes pulling an image.
         self._lock = threading.Lock()
@@ -94,17 +129,26 @@ class HelperServer:
         payload = request["payload"]
         req_type = request["type"]
 
+        if not isinstance(payload, dict):
+            raise HelperError("INVALID_REQUEST", "payload must be an object")
+
         # Reads are safe to repeat: no journal, no nonce consumption.
         if req_type == "inspect":
-            return {"ok": True, "result": self.backend.inspect(payload["runtime_id"])}
+            found = self.backend.inspect(self._runtime_id(payload))
+            # Only containers this helper launched are described to the agent.
+            return {"ok": True, "result": found if found and found.get("ownership_marker") else None}
         if req_type == "list":
             return {"ok": True, "result": self.backend.list_all()}
         if req_type == "logs":
-            limit = max(1, min(int(payload.get("max_bytes", MAX_LOG_BYTES)), MAX_LOG_BYTES))
-            if self.backend.inspect(payload["runtime_id"]) is None:
+            runtime_id = self._runtime_id(payload)
+            max_bytes = payload.get("max_bytes", MAX_LOG_BYTES)
+            if type(max_bytes) is not int:
+                raise HelperError("INVALID_REQUEST", "max_bytes must be an integer")
+            limit = max(1, min(max_bytes, MAX_LOG_BYTES))
+            if self.backend.inspect(runtime_id) is None:
                 return {"ok": True, "result": ""}
-            self._require_owned(payload["runtime_id"])
-            return {"ok": True, "result": self.backend.logs(payload["runtime_id"], limit)}
+            self._require_owned(runtime_id)
+            return {"ok": True, "result": self.backend.logs(runtime_id, limit)}
 
         op_id = request["operation_id"]
         digest = _digest({"type": req_type, "payload": payload})
@@ -121,7 +165,9 @@ class HelperServer:
             nonce = request["nonce"]
             if nonce in self._seen_nonces:
                 raise HelperError("REPLAY", "nonce already used")
-            self._seen_nonces.add(nonce)
+            self._seen_nonces[nonce] = None
+            if len(self._seen_nonces) > MAX_NONCES:
+                del self._seen_nonces[next(iter(self._seen_nonces))]
         result = self._execute(req_type, payload)
         with self._lock:
             self.journal.mark(op_id, COMMITTED, result=result)
@@ -129,20 +175,32 @@ class HelperServer:
 
     def _execute(self, req_type: str, payload: dict) -> str:
         if req_type == "launch":
-            self._validate_launch(payload)
-            return self.backend.launch(payload)
+            mount = self._validate_launch(payload)
+            return self.backend.launch({**payload, "artifact_mount": mount})
         if req_type == "launch_job":
-            self._validate_job(payload)
-            return self.backend.launch_job(payload)
+            return self.backend.launch_job(self._validate_job(payload))
         if req_type == "stop":
-            self._require_owned(payload["runtime_id"])
-            self.backend.stop(payload["runtime_id"], payload.get("force_after_seconds", 30))
-            return str(payload["runtime_id"])
+            runtime_id = self._runtime_id(payload)
+            grace = payload.get("force_after_seconds", 30)
+            if type(grace) is not int or not 0 <= grace <= 3600:
+                raise HelperError("INVALID_REQUEST", "force_after_seconds must be an integer from 0 to 3600")
+            self._require_owned(runtime_id)
+            self.backend.stop(runtime_id, grace)
+            return runtime_id
         if req_type == "remove":
-            self._require_owned(payload["runtime_id"])
-            self.backend.remove(payload["runtime_id"])
-            return str(payload["runtime_id"])
-        raise HelperError("INVALID_REQUEST", f"unknown request type {req_type}")
+            runtime_id = self._runtime_id(payload)
+            self._require_owned(runtime_id)
+            self.backend.remove(runtime_id)
+            return runtime_id
+        raise HelperError("INVALID_REQUEST", "unknown request type")
+
+    def _runtime_id(self, payload: dict) -> str:
+        """The runtime id must have the shape this backend hands out, so it can
+        never be read as a docker option or name some other kind of object."""
+        runtime_id = payload.get("runtime_id")
+        if not isinstance(runtime_id, str) or not self.backend.RUNTIME_ID.fullmatch(runtime_id):
+            raise HelperError("POLICY_DENIED", "invalid runtime id")
+        return runtime_id
 
     def _require_owned(self, runtime_id: str) -> None:
         """Only containers this helper launched (they carry an ownership marker) may be touched."""
@@ -150,59 +208,87 @@ class HelperServer:
         if not (found and found.get("ownership_marker")):
             raise HelperError("POLICY_DENIED", f"container {runtime_id} was not launched by this helper")
 
-    def _validate_job(self, payload: dict) -> None:
-        """Re-check a job against local policy. The agent already did; the helper
-        trusts nothing it is sent (DESIGN.md 14.1, 25)."""
-        from .models import IMAGE_REF
-
+    def _validate_job(self, payload: dict) -> dict:
+        """Re-check a job against local policy and return the spec the backend
+        runs. The agent already checked; the helper trusts nothing it is sent
+        (DESIGN.md 14.1, 25). Platform fields (memory cap, CPUs, bind address)
+        come from the helper's own policy, never from the request."""
         p = self.policy
         if not p.jobs_enabled:
             raise HelperError("POLICY_DENIED", "jobs are disabled by this host's policy")
+        # A job may never ask for host access: only known fields are accepted.
+        for name in payload:
+            if name not in JOB_FIELDS:
+                raise HelperError("POLICY_DENIED", "job field not permitted: " + repr(name)[:64])
         image = payload.get("image")
-        if not isinstance(image, str) or not IMAGE_REF.match(image):
+        if not isinstance(image, str) or len(image) > MAX_IMAGE_REF or not IMAGE_REF.fullmatch(image):
             raise HelperError("POLICY_DENIED", "job image must be a digest-pinned reference")
         if p.allowed_job_registries and image.split("/", 1)[0] not in p.allowed_job_registries:
             raise HelperError("POLICY_DENIED", f"registry not allow-listed: {image.split('/', 1)[0]}")
         if not p.job_allow_any_image and image.rsplit("@", 1)[1] not in p.allowed_job_image_digests:
             raise HelperError("POLICY_DENIED", f"image not allow-listed: {image.rsplit('@', 1)[1]}")
-        for dev in payload.get("device_ids", []):
-            if dev not in p.allowed_devices:
-                raise HelperError("POLICY_DENIED", f"device not allow-listed: {dev}")
+        job_key, marker = payload.get("job_key"), payload.get("ownership_marker")
+        if not isinstance(job_key, str) or not JOB_ID.fullmatch(job_key):
+            raise HelperError("POLICY_DENIED", "invalid job key")
+        if not isinstance(marker, str) or not OWNERSHIP_MARKER.fullmatch(marker):
+            raise HelperError("POLICY_DENIED", "invalid ownership marker")
+        devices = payload.get("device_ids", [])
+        if not isinstance(devices, list) or len(set(devices)) != len(devices):
+            raise HelperError("POLICY_DENIED", "device_ids must be a list of distinct devices")
+        for dev in devices:
+            if not isinstance(dev, str) or not DEVICE_ID.fullmatch(dev) or dev not in p.allowed_devices:
+                raise HelperError("POLICY_DENIED", "device not allow-listed: " + repr(dev)[:140])
         port = payload.get("port", 0)
-        if not isinstance(port, int) or (port and not (p.job_port_start <= port < p.job_port_stop)):
-            raise HelperError("POLICY_DENIED", f"port {port} outside the job port range")
+        if type(port) is not int or (port and not (p.job_port_start <= port < p.job_port_stop)):
+            raise HelperError("POLICY_DENIED", f"port {port!r:.16} outside the job port range")
+        memory = payload.get("memory_limit_bytes", 0)
+        if type(memory) is not int or memory < 0:
+            raise HelperError("POLICY_DENIED", "memory_limit_bytes must be a non-negative integer")
+        if memory > p.job_memory_max_bytes:
+            raise HelperError(
+                "POLICY_DENIED", f"memory limit above this host's maximum of {p.job_memory_max_bytes} bytes"
+            )
         args, env = payload.get("args", []), payload.get("env", {})
-        if not isinstance(args, list) or len(args) > MAX_JOB_ARGS or not all(
-            isinstance(a, str) and len(a) <= MAX_JOB_STRING and "\x00" not in a for a in args
-        ):
-            raise HelperError("POLICY_DENIED", "job args must be a bounded list of strings")
-        if not isinstance(env, dict) or len(env) > MAX_JOB_ENV:
-            raise HelperError("POLICY_DENIED", "job env must be a bounded mapping")
-        for k, v in env.items():
-            if not isinstance(k, str) or not _ENV_NAME.match(k):
-                raise HelperError("POLICY_DENIED", f"invalid environment variable name: {k!r}")
-            if not isinstance(v, str) or len(v) > MAX_JOB_STRING or "\x00" in v:
-                raise HelperError("POLICY_DENIED", f"invalid value for environment variable {k}")
-        # A job may never ask for host access: these are not part of the request shape.
-        for forbidden in ("mounts", "volumes", "privileged", "network", "cap_add", "devices", "user", "pid"):
-            if forbidden in payload:
-                raise HelperError("POLICY_DENIED", f"job field not permitted: {forbidden}")
+        error = job_strings_error(args, env)
+        if error:
+            raise HelperError("POLICY_DENIED", error)
+        return {
+            "job_key": job_key, "ownership_marker": marker, "image": image, "args": list(args), "env": dict(env),
+            "device_ids": list(devices), "port": port,
+            "memory_limit_bytes": memory or p.job_memory_default_bytes,
+            "cpus": p.job_cpus, "bind_address": p.job_bind_address,
+        }
 
-    def _validate_launch(self, payload: dict) -> None:
+    def _validate_launch(self, payload: dict) -> str:
+        """Check an engine launch; returns the resolved artifact mount source."""
         p = self.policy
         if payload.get("image_digest") not in p.allowed_image_digests:
             raise HelperError("POLICY_DENIED", f"image not allow-listed: {payload.get('image_digest')}")
         for dev in payload.get("device_ids", []):
-            if dev not in p.allowed_devices:
+            if not isinstance(dev, str) or not DEVICE_ID.fullmatch(dev) or dev not in p.allowed_devices:
                 raise HelperError("POLICY_DENIED", f"device not allow-listed: {dev}")
         port = payload.get("port", -1)
-        if not (p.port_start <= port < p.port_stop):
+        if type(port) is not int or not (p.port_start <= port < p.port_stop):
             raise HelperError("POLICY_DENIED", f"port {port} outside allowed range")
-        mount = payload.get("artifact_mount", "")
-        if not any(mount.startswith(root) for root in p.allowed_mount_roots):
-            raise HelperError("POLICY_DENIED", f"mount outside allowed roots: {mount}")
         if "command" in payload or "args_override" in payload:
             raise HelperError("POLICY_DENIED", "free-form command not permitted")
+        return self._mount_source(payload.get("artifact_mount"))
+
+    def _mount_source(self, mount: object) -> str:
+        """Resolve the artifact mount and require it strictly inside an allowed
+        root by path components: `..`, look-alike prefixes (`/root-evil`) and
+        symlinks that lead outside are refused. The resolved path is what docker
+        mounts, so docker never follows a link the helper did not check."""
+        if not isinstance(mount, str) or not mount.startswith("/") or "\x00" in mount or ".." in mount.split("/"):
+            raise HelperError("POLICY_DENIED", "artifact mount must be an absolute path without '..'")
+        real = Path(os.path.realpath(mount))
+        if not MOUNT_PATH.fullmatch(str(real)):
+            raise HelperError("POLICY_DENIED", "artifact mount path has characters outside [A-Za-z0-9._/+-]")
+        for root in self.policy.allowed_mount_roots:
+            real_root = Path(os.path.realpath(root))
+            if real != real_root and real.is_relative_to(real_root):
+                return str(real)
+        raise HelperError("POLICY_DENIED", "artifact mount outside allowed roots")
 
 
 def unix_socket_send(socket_path: str):
@@ -271,13 +357,25 @@ def respond(server: "HelperServer", raw: bytes) -> dict:
 class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESIGN.md 20 host tests)
     """Real backend shelling to the Docker CLI. Ownership is tracked with a
     container label so adoption survives helper restarts. Images are launched by
-    digest via a policy-provided repository map (never a free-form ref)."""
+    digest via a policy-provided repository map (never a free-form ref).
+
+    Every value is its own argv element after the option it belongs to, and
+    `--` ends the options before any positional argument."""
 
     LABEL = "dev.meridian.ownership"
+    RUNTIME_ID = re.compile(r"[0-9a-f]{12,64}")  # `docker run -d` and `docker ps -q` ids
+    # One user-defined bridge for every job container, with inter-container
+    # traffic disabled: a job cannot reach another job's container directly,
+    # only ports published on the bind address (DESIGN.md 25.3). The fixed
+    # interface name lets an operator add egress rules for it.
+    JOB_NETWORK = "meridian-jobs"
+    JOB_NETWORK_OPTS = ("com.docker.network.bridge.enable_icc=false", "com.docker.network.bridge.name=meridian-jobs")
 
-    def __init__(self, image_repos: dict[str, str]):
+    def __init__(self, image_repos: dict[str, str], env_dir: Optional[str] = None):
         # image_digest -> "repo@sha256:..." reference the daemon may pull.
         self.image_repos = image_repos
+        # Where job env files live for the moment `docker run` reads them. None = the system temp dir.
+        self.env_dir = env_dir
 
     def _run(self, args: list[str]) -> str:
         import subprocess
@@ -292,20 +390,21 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
             "run", "-d", "--restart", "no",
             "--label", f"{self.LABEL}={spec['ownership_marker']}",
             "-p", f"{spec['port']}:{spec['port']}",
-            "-v", f"{spec['artifact_mount']}:/model:ro",
+            # The source was resolved and checked by HelperServer._mount_source.
+            "--mount", f"type=bind,source={spec['artifact_mount']},target=/model,readonly",
         ]
         if spec.get("device_ids"):
             args += ["--gpus", '"device=' + ",".join(spec["device_ids"]) + '"']
         if spec.get("memory_limit_bytes"):
             args += ["--memory", str(spec["memory_limit_bytes"])]
-        args += [image_ref, *spec.get("args", [])]
+        args += ["--", image_ref, *spec.get("args", [])]
         return self._run(args)
 
     def inspect(self, runtime_id: str) -> Optional[dict]:
         import json as _json
 
         try:
-            out = self._run(["inspect", runtime_id])
+            out = self._run(["inspect", "--type", "container", "--", runtime_id])
         except Exception:
             return None
         data = _json.loads(out)[0]
@@ -321,16 +420,46 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
         }
 
     def stop(self, runtime_id: str, force_after_seconds: int) -> None:
-        self._run(["stop", "-t", str(force_after_seconds), runtime_id])
+        self._run(["stop", "-t", str(int(force_after_seconds)), "--", runtime_id])
 
     def list_all(self) -> list[dict]:
         ids = self._run(["ps", "-q", "--filter", f"label={self.LABEL}"]).split()
-        return [s for s in (self.inspect(i) for i in ids) if s]
+        return [s for s in (self.inspect(i) for i in ids if self.RUNTIME_ID.fullmatch(i)) if s]
+
+    def _job_network(self) -> str:
+        """Create the job network on first use and refuse one that lets
+        containers talk to each other (for example one created by hand)."""
+        import subprocess
+
+        icc = ["network", "inspect", "--format", '{{index .Options "com.docker.network.bridge.enable_icc"}}', "--"]
+        try:
+            found = self._run([*icc, self.JOB_NETWORK])
+        except subprocess.CalledProcessError:
+            create = ["network", "create", "--driver", "bridge", "--label", f"{self.LABEL}=network"]
+            for opt in self.JOB_NETWORK_OPTS:
+                create += ["--opt", opt]
+            try:
+                self._run([*create, "--", self.JOB_NETWORK])
+            except subprocess.CalledProcessError:
+                pass  # created by a concurrent launch; checked below
+            found = self._run([*icc, self.JOB_NETWORK])
+        if found != "false":
+            raise HelperError(
+                "POLICY_DENIED", f"network {self.JOB_NETWORK} exists with inter-container traffic enabled"
+            )
+        return self.JOB_NETWORK
 
     def launch_job(self, spec: dict) -> str:
         """Run a tenant container with no host access: no mounts, no added
-        capabilities, no privilege escalation, a bounded process count. It gets
-        only the GPUs it was assigned and, optionally, one published port."""
+        capabilities, no privilege escalation, bounded processes and memory, its
+        own network with no path to other jobs' containers, only its assigned
+        GPUs and, optionally, one port published on the policy's bind address.
+
+        Env goes through a 0600 file, never the command line, so other local
+        users cannot read it from the process list. `spec` is the output of
+        HelperServer._validate_job."""
+        import tempfile
+
         args = [
             "run", "-d", "--restart", "no",
             "--label", f"{self.LABEL}={spec['ownership_marker']}",
@@ -338,32 +467,47 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "8192",
             "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
+            "--network", self._job_network(),
+            # Swap equal to memory: the cap is not stretched by swapping. A job is
+            # the first thing the kernel kills if the host still runs out.
+            "--memory", str(spec["memory_limit_bytes"]), "--memory-swap", str(spec["memory_limit_bytes"]),
+            "--oom-score-adj", "500",
         ]
-        if spec.get("device_ids"):
+        if spec["cpus"]:
+            args += ["--cpus", str(spec["cpus"])]
+        if spec["device_ids"]:
             args += ["--gpus", '"device=' + ",".join(spec["device_ids"]) + '"']
-        if spec.get("memory_limit_bytes"):
-            args += ["--memory", str(spec["memory_limit_bytes"])]
-        if spec.get("port"):
-            args += ["-p", f"{spec['port']}:{spec['port']}"]
-        for k, v in sorted((spec.get("env") or {}).items()):
-            args += ["-e", f"{k}={v}"]
-        args += [spec["image"], *spec.get("args", [])]
-        return self._run(args)
+        if spec["port"]:
+            host = spec["bind_address"]
+            host = f"[{host}]" if ":" in host else host
+            args += ["-p", f"{host}:{spec['port']}:{spec['port']}"]
+        # Platform values last and merged over the job's own: they always win.
+        env = {**spec["env"], **gpu_env(spec["device_ids"])}
+        fd, env_file = tempfile.mkstemp(prefix="meridian-job-env-", dir=self.env_dir)  # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(f"{k}={v}\n" for k, v in env.items())
+            args += ["--env-file", env_file, "--", spec["image"], *spec["args"]]
+            return self._run(args)
+        finally:
+            os.unlink(env_file)  # `docker run -d` has read it and started the container
 
     def logs(self, runtime_id: str, max_bytes: int) -> str:
         import subprocess
 
         r = subprocess.run(
-            ["docker", "logs", "--tail", "200", runtime_id], capture_output=True, text=True, errors="replace",
+            ["docker", "logs", "--tail", "200", "--", runtime_id], capture_output=True, text=True, errors="replace",
         )
         return (r.stdout + r.stderr)[-max_bytes:]
 
     def remove(self, runtime_id: str) -> None:
-        self._run(["rm", "-f", runtime_id])
+        self._run(["rm", "-f", "--", runtime_id])
 
 
 class FakeContainerBackend:
     """In-memory backend for helper protocol tests."""
+
+    RUNTIME_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # Docker's container-name grammar
 
     def __init__(self):
         self._c: dict[str, dict] = {}

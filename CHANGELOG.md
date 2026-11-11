@@ -2,6 +2,35 @@
 
 ## 0.1.0 (unreleased)
 
+- **Job isolation and the helper boundary (security audit H4, M8; DESIGN.md
+  25.3-25.6).** The root helper now sets GPU visibility for every job
+  container itself (`NVIDIA_VISIBLE_DEVICES=void` and no `--gpus` for a 0-GPU
+  job) and rejects `NVIDIA_*`, `CUDA_VISIBLE_DEVICES` and `CUDA_MPS_*` in job
+  env, in the model and again in the helper. The helper accepts only known job
+  fields and re-validates each with allow-list patterns and size bounds. Job
+  env goes through a 0600 env file instead of `-e` on the command line. Job
+  containers get a memory cap (new `policy.job_memory_default_bytes`, 32 GiB,
+  and `policy.job_memory_max_bytes`, 256 GiB), swap capped to the same value,
+  an OOM score that sacrifices jobs before the agent, an optional CPU limit
+  (`policy.job_cpus`, default none), and the `meridian-jobs` bridge with
+  inter-container traffic disabled. Published job ports bind to
+  `policy.job_bind_address` (default: `engine_host`) instead of every
+  interface. **Operators:** a service that was reached through an interface
+  other than `engine_host` is no longer reachable there; set
+  `job_bind_address` to expose it deliberately. Job env values may no longer
+  contain line breaks.
+- The helper validates `runtime_id` against the backend's id shape and puts
+  `--` before positional arguments in every Docker call; `inspect` describes
+  only containers it launched. The engine artifact mount is resolved and
+  checked by path components (no `..`, look-alike prefixes or symlink escapes)
+  and passed with `--mount type=bind,…,readonly`; the allowed root is now the
+  verified-artifact cache, not the whole state directory. The nonce replay
+  window is bounded.
+- `engine_host` must be an IP or an RFC 1123 host name; IPv6 endpoints are
+  bracketed. Job `log_tail`, `reason` and `message` are bounded in bytes and
+  sent as valid UTF-8. A job whose spec fails validation is reported
+  `Failed/InvalidSpec` instead of stopping the node from applying its
+  snapshot. Metric label values are escaped.
 - **Batch jobs and services (DESIGN.md 25).** The agent runs digest-pinned
   containers to completion (`job`) or until stopped (`service`), next to engines.
   Off unless `policy.jobs_enabled` is set. A job is launched at most once, even

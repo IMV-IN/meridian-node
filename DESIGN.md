@@ -1821,7 +1821,7 @@ no shell commands, and the control plane still decides what runs.
 omits the key, and the control plane places jobs only on nodes that report
 `capacity.jobs_enabled`, so an older agent never receives one.
 
-A job replica is `{job_id, replica, kind, image, args, env, device_ids, port,
+A job replica is `{job_id, replica, kind, image, args, env, device_ids, memory_limit_bytes, port,
 timeout_seconds, desired_phase}`. `image` MUST be `<registry>/<repo>@sha256:…`.
 Phases: `Pending → Starting → Running → Succeeded | Failed | Cancelled`.
 
@@ -1864,25 +1864,155 @@ container that carries an ownership marker.
 `policy.jobs_enabled` is off by default and is separate from
 `management_enabled`. With it on, a job must match `allowed_job_image_digests`,
 unless `job_allow_any_image` is set, and `allowed_job_registries` when that list
-is non-empty. The agent checks the policy and the root helper checks it again,
-along with devices, the job port range, and bounded `args` and `env`. The helper
-rejects any request field that would grant host access (mounts, privileged,
-network, capabilities, devices, user).
+is non-empty. The agent checks the policy and the root helper checks it again.
 
-The container runs with `--cap-drop ALL`, `no-new-privileges`, a pids limit,
-bounded logs, no mounts, only its assigned GPUs, and at most one published port.
+**The helper is the trust boundary.** It re-validates every field of a
+`launch_job` request with allow-list patterns, whatever the agent already
+checked, and refuses any field it does not know (so `network`, `privileged`,
+`cpus`, `user`, mounts and the like cannot be smuggled in). Each value becomes
+its own argv element after the option it belongs to; `--` ends the options
+before the image and before every runtime id; there is no shell.
+
+| Field | Rule |
+|---|---|
+| `image` | `<registry>/<repo>@sha256:<64 hex>`, at most 512 characters, full match (cannot start with `-`) |
+| `job_key`, `job_id` | `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` |
+| `ownership_marker` | `[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}` |
+| `device_ids` | distinct, `[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}`, in the local device list |
+| `port` | 0, or inside `job_port_range` |
+| `args` | at most 256 strings, each at most 8 KiB (UTF-8) and without NUL |
+| `env` | at most 128 entries; names `[A-Za-z_][A-Za-z0-9_]{0,127}`, not reserved; values at most 8 KiB, no NUL, CR or LF |
+| `args` + `env` | at most 256 KiB together |
+| `memory_limit_bytes` | integer, at most `job_memory_max_bytes` |
+| `runtime_id` (stop, remove, logs, inspect) | the backend's own id shape (Docker: 12-64 lowercase hex); `inspect` only describes containers the helper launched |
+
+**GPU visibility.** The helper sets `NVIDIA_VISIBLE_DEVICES`,
+`NVIDIA_DRIVER_CAPABILITIES` and `CUDA_VISIBLE_DEVICES` for every job container,
+after the job's own env, so neither the job nor its image's `ENV` decides which
+GPUs it sees. With assigned devices it passes exactly those (`--gpus
+"device=…"` and the same list in `NVIDIA_VISIBLE_DEVICES`). With none it passes
+no `--gpus` and sets `NVIDIA_VISIBLE_DEVICES=void`, which the NVIDIA container
+runtime treats as "no GPU", so a host whose Docker default runtime is `nvidia`
+does not hand the container every GPU. A job may not set `NVIDIA_*` (except
+`NVIDIA_TF32_OVERRIDE`, a numerics switch), `CUDA_VISIBLE_DEVICES` or
+`CUDA_MPS_*`: the model and the helper both reject them. `MERIDIAN_*` names are
+set by the control plane inside `env` (it reserves them from users at submit
+time), so the node accepts them. On a job host, also set
+`accept-nvidia-visible-devices-envvar-when-unprivileged = false` in
+`/etc/nvidia-container-runtime/config.toml` if the containers never need the
+legacy env interface. A job whose spec fails these checks is reported
+`Failed/InvalidSpec`; the rest of the snapshot is applied.
+
+**Env is never on the command line.** The helper writes the env to a 0600 file
+in its runtime directory (`/run/meridian-node`, a root-owned tmpfs), passes it
+with `--env-file`, and removes it once `docker run -d` returns. Platform values
+are merged over the job's and written last. The values are still visible to
+anyone who can run `docker inspect` on the host (root and the `docker` group).
+
+**Container limits.** Every job container runs with `--cap-drop ALL`,
+`no-new-privileges`, `--pids-limit 8192`, bounded logs and no mounts, plus:
+
+- memory: `--memory` and `--memory-swap` set to the job's `memory_limit_bytes`,
+  or `policy.job_memory_default_bytes` (32 GiB) when it asks for none; a request
+  above `policy.job_memory_max_bytes` (256 GiB) is refused. `--oom-score-adj
+  500`, so if the host still runs out of memory the kernel kills a job before
+  the agent or the helper;
+- CPU: `--cpus policy.job_cpus` when it is above 0 (default: no limit);
+- network: see 25.6;
+- a published port binds to `policy.job_bind_address`, an IP literal. Empty
+  means `engine_host`, the address the node advertises (which must then be an
+  IP). Ports are never published on every interface unless the owner sets
+  `0.0.0.0`. To expose a service on purpose, set `job_bind_address` (and
+  `engine_host`, which the control plane hands out as the endpoint) to the
+  interface users reach.
+
+The root filesystem stays writable: Jupyter writes under the home directory,
+vLLM caches model downloads under `~/.cache/huggingface`, and PyTorch jobs write
+checkpoints, so `--read-only` would break the shipped templates. There is no
+per-container disk quota (`--storage-opt size=` works only on overlay2 over XFS
+with project quotas).
+
 This is container isolation, not a VM boundary: a host that accepts arbitrary
 images should be one its owner is prepared to treat that way.
 
+**Engine mounts.** An engine's artifact mount is resolved (`realpath`) and must
+lie strictly inside the verified-artifact cache by path components, so `..`,
+look-alike prefixes and symlinks that lead outside are refused. Docker gets the
+resolved path in `--mount type=bind,source=…,target=/model,readonly`, and the
+path may only contain `[A-Za-z0-9._/+-]`. Residual risk: the agent user owns the
+cache, so a compromised agent could swap a checked directory for a symlink
+between the check and the mount.
+
 ### 25.4 Privacy
 
-`log_tail` (at most 8 KB) is the tenant's own output and is returned only to the
-tenant's workspace. The control plane redacts image, arguments, environment and
-logs from what a node's owner can read when the job belongs to another workspace.
+`log_tail` is the tenant's own output and is returned only to the tenant's
+workspace. The node bounds it to 8 KiB of valid UTF-8 (cut on a character
+boundary; NUL and undecodable bytes become U+FFFD) and bounds `reason` and
+`message` to 256 and 1024 bytes. It removes nothing else: the CLI and console
+escape control characters when they display it. The control plane redacts
+image, arguments, environment and logs from what a node's owner can read when
+the job belongs to another workspace.
+
+The node reports `advertise_host` and builds service endpoints from
+`policy.engine_host`, which must be an IP literal or an RFC 1123 host name of at
+most 253 characters (IPv6 endpoints are bracketed). Service endpoints are plain
+`http://`: terminate TLS in front of a service that carries credentials.
 
 ### 25.5 Not included
 
-Volumes and datasets, job secrets, restart policies, and network isolation
-between a job and the host's LAN. No memory cap is applied unless the control
-plane sends one. Jobs use Docker's default bridge network, so they can reach the
-host's LAN.
+Volumes and datasets, job secrets, restart policies, a read-only root
+filesystem, and a disk quota. The node receives a tenant's `env`, `args` and
+service token by design: a host's root user can read them.
+
+### 25.6 Network isolation
+
+Every job container joins one user-defined bridge, `meridian-jobs` (interface
+`meridian-jobs`), created by the helper on first use with
+`com.docker.network.bridge.enable_icc=false`. The helper refuses to use a
+network of that name that allows inter-container traffic. One network for all
+jobs, rather than one per job, avoids exhausting Docker's default address
+pools (about 30 networks) on a busy node; with ICC off it gives the same
+separation.
+
+What it covers (checked on Docker 29 without a GPU):
+
+- a job cannot reach another job's container by its bridge IP;
+- a job cannot reach engines or other containers on Docker's default bridge
+  through ports they do not publish;
+- published ports listen only on `job_bind_address`.
+
+What it does not cover:
+
+- **Published ports are reachable by anyone who can reach the bind address,
+  other jobs included.** Multi-replica training (DDP) depends on this: replicas
+  find each other at `advertise_host:port` (`{{peers}}`, `{{master}}`), across
+  nodes and on the same node. A `torchrun` c10d rendezvous is unauthenticated,
+  so another tenant who can reach that address can join it. Services must
+  authenticate (the Jupyter and vLLM templates use the service token). Same-node
+  replicas reach each other through Docker's userland proxy; with
+  `"userland-proxy": false` in `daemon.json`, ICC off also drops that hairpin
+  traffic, and same-node replicas cannot connect.
+- **Egress is not filtered.** A job can reach the host's LAN, the host itself
+  on any address it listens on, and a cloud metadata service
+  (`169.254.169.254`). Blocking private ranges needs firewall rules in the
+  host's `DOCKER-USER` chain; the agent does not run as root and the helper
+  does not edit the firewall, so this is not a policy option. An owner who wants
+  it adds rules for the fixed interface, for example:
+
+  ```
+  iptables -I DOCKER-USER -i meridian-jobs -d 169.254.0.0/16 -j DROP
+  iptables -I DOCKER-USER -i meridian-jobs -d 10.0.0.0/8 -j DROP
+  iptables -I DOCKER-USER -i meridian-jobs -d 172.16.0.0/12 -j DROP
+  iptables -I DOCKER-USER -i meridian-jobs -d 192.168.0.0/16 -j DROP
+  ```
+
+  (and the equivalent `ip6tables` or `nftables` rules), with an `ACCEPT` placed
+  before them for any registry or mirror on those ranges and for `-m conntrack
+  --ctstate ESTABLISHED,RELATED`, so replies to published ports still flow.
+- NCCL opens further, random ports between ranks; across nodes those are not
+  published, so multi-node NCCL on bridge networking needs host networking or
+  an overlay, which this release does not provide.
+- With `"iptables": false` in `daemon.json`, Docker installs no isolation rules
+  and ICC off has no effect.
+- GPU memory is not scrubbed between jobs, and kernel or driver bugs cross
+  containers.

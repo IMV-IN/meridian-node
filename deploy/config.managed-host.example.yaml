@@ -38,3 +38,11 @@ policy:
   allowed_job_registries: []         # empty = any registry
   job_port_range: [9000, 9100]
   job_max_runtime_seconds: 0         # 0 = no host-side ceiling
+  # Address published job ports bind to (an IP). Empty = engine_host, the
+  # address the node advertises. Ports are never published on all interfaces
+  # unless you set 0.0.0.0 on purpose; to expose services publicly, set this to
+  # the public interface's address (and advertise that address as engine_host).
+  job_bind_address: ""
+  job_memory_default_bytes: 34359738368   # 32 GiB cap for a job that asks for none
+  job_memory_max_bytes: 274877906944      # 256 GiB: the largest cap a job may ask for
+  job_cpus: 0                             # CPUs per job container (docker --cpus); 0 = no limit

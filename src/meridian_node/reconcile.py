@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .jobs import JobSupervisor, rejected_observations
-from .models import Assignment, DesiredPhase, DesiredSnapshot, EnginePhase
+from .models import Assignment, DesiredPhase, DesiredSnapshot, EnginePhase, url_host
 from .state import StateStore
 from .supervisor import EngineSupervisor
 
@@ -78,6 +78,8 @@ class Reconciler:
                 snapshot.jobs, "JobsDisabled", "jobs are disabled by this host's policy", self.now
             )
             observation["capacity"]["jobs_enabled"] = False
+        for bad in snapshot.invalid_jobs:  # never ran: a spec the node refuses to parse
+            observation["jobs"] += rejected_observations([bad], "InvalidSpec", bad.message, self.now)
         return observation
 
     def _synthetic_stop(self, assignment: Assignment) -> Assignment:
@@ -91,7 +93,7 @@ class Reconciler:
             endpoint = ""
             loaded = None
             if st.phase == EnginePhase.READY and st.handle is not None:
-                endpoint = f"https://{self.supervisor.engine_host}:{st.handle.port}"
+                endpoint = f"https://{url_host(self.supervisor.engine_host)}:{st.handle.port}"
                 loaded = assignment.artifact.manifest_digest
             engines.append({
                 "engine_id": engine_id,

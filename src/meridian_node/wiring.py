@@ -160,6 +160,7 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
                 allowed_image_digests=frozenset(policy.allowed_job_image_digests),
                 allowed_registries=frozenset(policy.allowed_job_registries),
                 max_runtime_seconds=policy.job_max_runtime_seconds,
+                max_memory_bytes=policy.job_memory_max_bytes,
             ),
             advertise_host=policy.engine_host,
             **sup_kwargs,
