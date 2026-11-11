@@ -66,3 +66,5 @@ docker build -f deploy/docker/Dockerfile -t meridian-node .
 
 The container runs the non-root agent. The root helper runs on the host, not in
 the container, because it manages host Docker.
+
+Published images and the release process: [RELEASE.md](RELEASE.md).

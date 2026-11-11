@@ -2,6 +2,12 @@
 
 ## 0.1.0 (unreleased)
 
+- **Release workflow.** Pushing a `v*` tag (or a manual dispatch) builds the agent image for linux/amd64 and
+  linux/arm64 and pushes `ghcr.io/<owner>/meridian-node:{version,latest}`, and `<DOCKERHUB_USERNAME>/meridian-node`
+  too when the Docker Hub secrets are set. The tag must match the `pyproject.toml` version. The wheel and sdist are
+  uploaded as a workflow artifact (no GitHub Release, no PyPI). CI now runs with read-only permissions and cancels
+  superseded runs. See `docs/RELEASE.md`.
+
 - **Job isolation and the helper boundary (security audit H4, M8; DESIGN.md
   25.3-25.6).** The root helper now sets GPU visibility for every job
   container itself (`NVIDIA_VISIBLE_DEVICES=void` and no `--gpus` for a 0-GPU
