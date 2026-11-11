@@ -12,9 +12,37 @@
     "assignments": {
       "type": "array",
       "items": {"$ref": "#/$defs/assignment"}
+    },
+    "jobs": {
+      "description": "Batch job and service replicas for this node (DESIGN.md 25). Optional; absent means none.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/job"}
     }
   },
   "$defs": {
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "replica", "kind", "image"],
+      "properties": {
+        "job_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+        "replica": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string", "enum": ["job", "service"]},
+        "image": {
+          "description": "Digest-pinned image reference: <registry>/<repo>@sha256:<digest>",
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "@sha256:[0-9a-f]{64}$"
+        },
+        "args": {"type": "array", "maxItems": 256, "items": {"type": "string", "maxLength": 8192}},
+        "env": {"type": "object", "maxProperties": 128, "additionalProperties": {"type": "string", "maxLength": 8192}},
+        "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
+        "memory_limit_bytes": {"type": "integer", "minimum": 0},
+        "port": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "timeout_seconds": {"type": "integer", "minimum": 0},
+        "desired_phase": {"type": "string", "enum": ["Running", "Draining", "Stopped"]}
+      }
+    },
     "assignment": {
       "type": "object",
       "additionalProperties": false,

@@ -23,12 +23,39 @@
             "enum": ["Pending", "Pulling", "Starting", "Warming", "Ready", "Draining", "Stopped", "Failed", "Quarantined", "Orphaned"]
           },
           "restart_count": {"type": "integer", "minimum": 0},
-          "loaded_artifact_digest": {"$ref": "common.schema.json#/$defs/digest"},
+          "loaded_artifact_digest": {"anyOf": [{"$ref": "common.schema.json#/$defs/digest"}, {"type": "null"}]},
           "endpoint": {"type": "string", "maxLength": 512},
+          "model": {"type": "string", "maxLength": 512},
+          "queue_depth": {"type": ["integer", "null"], "minimum": 0},
           "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}}
         }
       }
     },
-    "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}}
+    "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}},
+    "capacity": {
+      "description": "Allocatable capacity and placement signals (VRAM per device, ports, held artifacts, jobs_enabled, advertise_host).",
+      "type": "object"
+    },
+    "jobs": {
+      "description": "Batch job and service replicas (DESIGN.md 25). log_tail is the last output of the tenant's own container.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["job_id", "replica", "phase"],
+        "properties": {
+          "job_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
+          "replica": {"type": "integer", "minimum": 0},
+          "phase": {"type": "string", "enum": ["Pending", "Starting", "Running", "Succeeded", "Failed", "Cancelled"]},
+          "exit_code": {"type": ["integer", "null"]},
+          "reason": {"type": "string", "maxLength": 256},
+          "message": {"type": "string", "maxLength": 1024},
+          "started_at": {"type": ["string", "null"]},
+          "finished_at": {"type": ["string", "null"]},
+          "endpoint": {"type": "string", "maxLength": 512},
+          "log_tail": {"type": "string", "maxLength": 8192}
+        }
+      }
+    }
   }
 }

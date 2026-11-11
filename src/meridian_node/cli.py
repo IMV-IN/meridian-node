@@ -37,7 +37,7 @@ def _run_loop(config: Config, once: bool, now=None) -> int:
 
     if config.managed_allowed():
         build_managed_reconciler(config, agent, now=now)
-        print("running in managed-host mode", file=sys.stderr)
+        print(f"running in managed-host mode (jobs {'on' if config.jobs_allowed() else 'off'})", file=sys.stderr)
     elif config.mode == "kubernetes-integrated":
         build_kubernetes_observer(config, agent)
         print("running in kubernetes-integrated mode (report-only, no engine launch)", file=sys.stderr)
@@ -80,6 +80,11 @@ def _run_helper(config: Config) -> int:
         allowed_devices=frozenset(p.device_capacity_bytes),
         port_start=p.port_range[0], port_stop=p.port_range[1],
         allowed_mount_roots=(str(config.state_dir),),
+        jobs_enabled=p.jobs_enabled,
+        job_allow_any_image=p.job_allow_any_image,
+        allowed_job_image_digests=frozenset(p.allowed_job_image_digests),
+        allowed_job_registries=frozenset(p.allowed_job_registries),
+        job_port_start=p.job_port_range[0], job_port_stop=p.job_port_range[1],
     )
     backend = DockerContainerBackend(image_repos={})  # repos supplied by deployment
     server = HelperServer(backend, Journal(config.state_dir / "helper.db"), policy)

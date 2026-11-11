@@ -13,5 +13,26 @@
       "conditions": []
     }
   ],
-  "conditions": []
+  "conditions": [],
+  "jobs": [
+    {
+      "job_id": "job_01J000000000000000000000",
+      "replica": 0,
+      "phase": "Running",
+      "exit_code": null,
+      "reason": "",
+      "message": "",
+      "started_at": "2026-11-10T10:00:00Z",
+      "finished_at": null,
+      "endpoint": "",
+      "log_tail": "epoch 1/3 loss 0.42\n"
+    }
+  ],
+  "capacity": {
+    "allocatable_vram_bytes": {
+      "GPU-fake-0": 0
+    },
+    "jobs_enabled": true,
+    "advertise_host": "10.0.0.5"
+  }
 }

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import threading
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -34,6 +36,13 @@ class HelperPolicy:
     port_start: int
     port_stop: int
     allowed_mount_roots: tuple[str, ...]
+    # Batch jobs (DESIGN.md 25). All off by default.
+    jobs_enabled: bool = False
+    job_allow_any_image: bool = False
+    allowed_job_image_digests: frozenset[str] = frozenset()
+    allowed_job_registries: frozenset[str] = frozenset()
+    job_port_start: int = 0
+    job_port_stop: int = 0
 
 
 class ContainerBackend(Protocol):
@@ -41,6 +50,16 @@ class ContainerBackend(Protocol):
     def inspect(self, runtime_id: str) -> Optional[dict]: ...
     def stop(self, runtime_id: str, force_after_seconds: int) -> None: ...
     def list_all(self) -> list[dict]: ...
+    def launch_job(self, spec: dict) -> str: ...
+    def logs(self, runtime_id: str, max_bytes: int) -> str: ...
+    def remove(self, runtime_id: str) -> None: ...
+
+
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+MAX_JOB_ARGS = 256
+MAX_JOB_ENV = 128
+MAX_JOB_STRING = 8192
+MAX_LOG_BYTES = 65536
 
 
 def _digest(payload: dict) -> str:
@@ -54,6 +73,9 @@ class HelperServer:
         self.policy = policy
         self.highest_epoch = 0
         self._seen_nonces: set[str] = set()
+        # Connections are served on separate threads. The lock guards the journal and nonce set; it is
+        # never held across a backend call, since `docker run` can block for minutes pulling an image.
+        self._lock = threading.Lock()
 
     def refresh_epoch(self, epoch: int) -> None:
         """Agent updates the accepted epoch after session establishment. A lower
@@ -77,32 +99,94 @@ class HelperServer:
             return {"ok": True, "result": self.backend.inspect(payload["runtime_id"])}
         if req_type == "list":
             return {"ok": True, "result": self.backend.list_all()}
+        if req_type == "logs":
+            limit = max(1, min(int(payload.get("max_bytes", MAX_LOG_BYTES)), MAX_LOG_BYTES))
+            if self.backend.inspect(payload["runtime_id"]) is None:
+                return {"ok": True, "result": ""}
+            self._require_owned(payload["runtime_id"])
+            return {"ok": True, "result": self.backend.logs(payload["runtime_id"], limit)}
 
         op_id = request["operation_id"]
         digest = _digest({"type": req_type, "payload": payload})
 
         # Idempotent replay wins first: a committed op returns its stored result
         # regardless of nonce, so a legitimate retry is always safe.
-        prior = self.journal.plan(op_id, digest, payload.get("engine_id", ""), request["fencing_epoch"], req_type)
-        if prior == COMMITTED:
-            row = self.journal.inspect(op_id)
-            return {"ok": True, "result": row.result if row else None, "replayed": True}
+        with self._lock:
+            prior = self.journal.plan(op_id, digest, payload.get("engine_id", ""), request["fencing_epoch"], req_type)
+            if prior == COMMITTED:
+                row = self.journal.inspect(op_id)
+                return {"ok": True, "result": row.result if row else None, "replayed": True}
 
-        # A fresh (uncommitted) mutation must carry an unused nonce.
-        nonce = request["nonce"]
-        if nonce in self._seen_nonces:
-            raise HelperError("REPLAY", "nonce already used")
-        self._seen_nonces.add(nonce)
+            # A fresh (uncommitted) mutation must carry an unused nonce.
+            nonce = request["nonce"]
+            if nonce in self._seen_nonces:
+                raise HelperError("REPLAY", "nonce already used")
+            self._seen_nonces.add(nonce)
+        result = self._execute(req_type, payload)
+        with self._lock:
+            self.journal.mark(op_id, COMMITTED, result=result)
+        return {"ok": True, "result": result}
+
+    def _execute(self, req_type: str, payload: dict) -> str:
         if req_type == "launch":
             self._validate_launch(payload)
-            runtime_id = self.backend.launch(payload)
-            self.journal.mark(op_id, COMMITTED, result=runtime_id)
-            return {"ok": True, "result": runtime_id}
+            return self.backend.launch(payload)
+        if req_type == "launch_job":
+            self._validate_job(payload)
+            return self.backend.launch_job(payload)
         if req_type == "stop":
+            self._require_owned(payload["runtime_id"])
             self.backend.stop(payload["runtime_id"], payload.get("force_after_seconds", 30))
-            self.journal.mark(op_id, COMMITTED, result=payload["runtime_id"])
-            return {"ok": True, "result": payload["runtime_id"]}
+            return str(payload["runtime_id"])
+        if req_type == "remove":
+            self._require_owned(payload["runtime_id"])
+            self.backend.remove(payload["runtime_id"])
+            return str(payload["runtime_id"])
         raise HelperError("INVALID_REQUEST", f"unknown request type {req_type}")
+
+    def _require_owned(self, runtime_id: str) -> None:
+        """Only containers this helper launched (they carry an ownership marker) may be touched."""
+        found = self.backend.inspect(runtime_id)
+        if not (found and found.get("ownership_marker")):
+            raise HelperError("POLICY_DENIED", f"container {runtime_id} was not launched by this helper")
+
+    def _validate_job(self, payload: dict) -> None:
+        """Re-check a job against local policy. The agent already did; the helper
+        trusts nothing it is sent (DESIGN.md 14.1, 25)."""
+        from .models import IMAGE_REF
+
+        p = self.policy
+        if not p.jobs_enabled:
+            raise HelperError("POLICY_DENIED", "jobs are disabled by this host's policy")
+        image = payload.get("image")
+        if not isinstance(image, str) or not IMAGE_REF.match(image):
+            raise HelperError("POLICY_DENIED", "job image must be a digest-pinned reference")
+        if p.allowed_job_registries and image.split("/", 1)[0] not in p.allowed_job_registries:
+            raise HelperError("POLICY_DENIED", f"registry not allow-listed: {image.split('/', 1)[0]}")
+        if not p.job_allow_any_image and image.rsplit("@", 1)[1] not in p.allowed_job_image_digests:
+            raise HelperError("POLICY_DENIED", f"image not allow-listed: {image.rsplit('@', 1)[1]}")
+        for dev in payload.get("device_ids", []):
+            if dev not in p.allowed_devices:
+                raise HelperError("POLICY_DENIED", f"device not allow-listed: {dev}")
+        port = payload.get("port", 0)
+        if not isinstance(port, int) or (port and not (p.job_port_start <= port < p.job_port_stop)):
+            raise HelperError("POLICY_DENIED", f"port {port} outside the job port range")
+        args, env = payload.get("args", []), payload.get("env", {})
+        if not isinstance(args, list) or len(args) > MAX_JOB_ARGS or not all(
+            isinstance(a, str) and len(a) <= MAX_JOB_STRING and "\x00" not in a for a in args
+        ):
+            raise HelperError("POLICY_DENIED", "job args must be a bounded list of strings")
+        if not isinstance(env, dict) or len(env) > MAX_JOB_ENV:
+            raise HelperError("POLICY_DENIED", "job env must be a bounded mapping")
+        for k, v in env.items():
+            if not isinstance(k, str) or not _ENV_NAME.match(k):
+                raise HelperError("POLICY_DENIED", f"invalid environment variable name: {k!r}")
+            if not isinstance(v, str) or len(v) > MAX_JOB_STRING or "\x00" in v:
+                raise HelperError("POLICY_DENIED", f"invalid value for environment variable {k}")
+        # A job may never ask for host access: these are not part of the request shape.
+        for forbidden in ("mounts", "volumes", "privileged", "network", "cap_add", "devices", "user", "pid"):
+            if forbidden in payload:
+                raise HelperError("POLICY_DENIED", f"job field not permitted: {forbidden}")
 
     def _validate_launch(self, payload: dict) -> None:
         p = self.policy
@@ -155,18 +239,33 @@ def serve_unix_socket(server: "HelperServer", socket_path: str) -> None:  # prag
     srv.listen(16)
     while True:
         conn, _ = srv.accept()
-        with conn:
-            buf = b""
-            while not buf.endswith(b"\n"):
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            try:
-                response = server.handle(json.loads(buf.decode()))
-            except HelperError as e:
-                response = {"ok": False, "code": e.code, "message": e.message}
-            conn.sendall((json.dumps(response) + "\n").encode())
+        threading.Thread(target=_serve_connection, args=(server, conn), daemon=True).start()
+
+
+def _serve_connection(server: "HelperServer", conn) -> None:  # pragma: no cover - daemon loop
+    with conn:
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        conn.sendall((json.dumps(respond(server, buf)) + "\n").encode())
+
+
+def respond(server: "HelperServer", raw: bytes) -> dict:
+    """One request's bytes in, one response out. Never raises: a failing backend (for example `docker
+    run` on an image that does not exist) must not take the daemon down."""
+    try:
+        return server.handle(json.loads(raw.decode()))
+    except HelperError as e:
+        return {"ok": False, "code": e.code, "message": e.message}
+    except Exception as e:
+        message = type(e).__name__
+        stderr = getattr(e, "stderr", None)  # subprocess errors: the command line may carry job env values
+        if isinstance(stderr, str) and stderr.strip():
+            message += ": " + stderr.strip()[-300:]
+        return {"ok": False, "code": "BACKEND_ERROR", "message": message}
 
 
 class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESIGN.md 20 host tests)
@@ -228,6 +327,40 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
         ids = self._run(["ps", "-q", "--filter", f"label={self.LABEL}"]).split()
         return [s for s in (self.inspect(i) for i in ids) if s]
 
+    def launch_job(self, spec: dict) -> str:
+        """Run a tenant container with no host access: no mounts, no added
+        capabilities, no privilege escalation, a bounded process count. It gets
+        only the GPUs it was assigned and, optionally, one published port."""
+        args = [
+            "run", "-d", "--restart", "no",
+            "--label", f"{self.LABEL}={spec['ownership_marker']}",
+            "--label", f"dev.meridian.job={spec['job_key']}",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--pids-limit", "8192",
+            "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
+        ]
+        if spec.get("device_ids"):
+            args += ["--gpus", '"device=' + ",".join(spec["device_ids"]) + '"']
+        if spec.get("memory_limit_bytes"):
+            args += ["--memory", str(spec["memory_limit_bytes"])]
+        if spec.get("port"):
+            args += ["-p", f"{spec['port']}:{spec['port']}"]
+        for k, v in sorted((spec.get("env") or {}).items()):
+            args += ["-e", f"{k}={v}"]
+        args += [spec["image"], *spec.get("args", [])]
+        return self._run(args)
+
+    def logs(self, runtime_id: str, max_bytes: int) -> str:
+        import subprocess
+
+        r = subprocess.run(
+            ["docker", "logs", "--tail", "200", runtime_id], capture_output=True, text=True, errors="replace",
+        )
+        return (r.stdout + r.stderr)[-max_bytes:]
+
+    def remove(self, runtime_id: str) -> None:
+        self._run(["rm", "-f", runtime_id])
+
 
 class FakeContainerBackend:
     """In-memory backend for helper protocol tests."""
@@ -235,6 +368,8 @@ class FakeContainerBackend:
     def __init__(self):
         self._c: dict[str, dict] = {}
         self._n = 0
+        self.job_specs: dict[str, dict] = {}
+        self.job_logs: dict[str, str] = {}
 
     def launch(self, spec: dict) -> str:
         self._n += 1
@@ -256,3 +391,20 @@ class FakeContainerBackend:
 
     def list_all(self) -> list[dict]:
         return list(self._c.values())
+
+    def launch_job(self, spec: dict) -> str:
+        self._n += 1
+        rid = f"ctr-{self._n}"
+        self._c[rid] = {
+            "runtime_id": rid, "alive": True, "image_digest": spec["image"].rsplit("@", 1)[1],
+            "ownership_marker": spec.get("ownership_marker", ""), "device_ids": spec.get("device_ids", []),
+            "port": spec.get("port", 0), "exit_code": None,
+        }
+        self.job_specs[rid] = spec
+        return rid
+
+    def logs(self, runtime_id: str, max_bytes: int) -> str:
+        return self.job_logs.get(runtime_id, "")[-max_bytes:]
+
+    def remove(self, runtime_id: str) -> None:
+        self._c.pop(runtime_id, None)

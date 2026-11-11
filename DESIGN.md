@@ -1804,3 +1804,85 @@ served `model` per ready engine so the projection can carry it.
   projection/placement read-freshness for write throughput, so it should follow a
   measured load profile rather than a guess. Connection pooling is the correct
   first lever and is in place.
+
+## 25. Batch Jobs and Services
+
+Section 3.2 listed "GPU scheduling across arbitrary workloads" as a non-goal of
+the initial design. This section is a deliberate, bounded extension of it: the
+agent can run a tenant's container next to engines, so the same fleet serves
+training and rented capacity (Meridian Compute, `docs/COMPUTE.md` in the
+Meridian repository). The decisions of Section 2 still hold. The agent executes
+no shell commands, and the control plane still decides what runs.
+
+### 25.1 Contract
+
+`desired-state` gains an optional `jobs` array and `observed-state` an optional
+`jobs` array plus `capacity`. Both are additive in `v1`: a snapshot without jobs
+omits the key, and the control plane places jobs only on nodes that report
+`capacity.jobs_enabled`, so an older agent never receives one.
+
+A job replica is `{job_id, replica, kind, image, args, env, device_ids, port,
+timeout_seconds, desired_phase}`. `image` MUST be `<registry>/<repo>@sha256:…`.
+Phases: `Pending → Starting → Running → Succeeded | Failed | Cancelled`.
+
+### 25.2 Differences from an engine
+
+| | Engine | Job |
+|---|---|---|
+| Arguments | Built by a driver from allow-listed parameters | Supplied by the tenant |
+| Launch | Restarted with backoff, quarantined | **At most once**; never restarted |
+| Stop | Needs drain authorization | Immediate; removal from the snapshot stops and removes it |
+| GPU | Shares a device by VRAM budget | Holds whole devices exclusively |
+| Readiness | Probed before `Ready` | None; `Running` means the container is alive |
+
+At-most-once is enforced with the operation journal. A committed launch resolves
+to the container that ran, alive or exited. A launch that was requested but not
+recorded is adopted only if a container with its ownership marker exists;
+otherwise the replica fails with `LaunchUncertain`. Training code is never run
+twice silently.
+
+`docker run` pulls the image, which can take minutes for an ML image, so the
+launch runs on a background thread. The journal row is marked started first, the
+replica stays in `Starting` for the whole pull, and a later reconcile records
+the result (`Running`, or `Failed/LaunchFailed`). The tick and heartbeat never
+wait on it. A stop or removal that arrives mid-launch waits for it to finish,
+then stops and removes the container. The helper serves each connection on its
+own thread and holds no lock while Docker runs, so `inspect`, `logs` and `stop`
+are not queued behind a pull. A failing backend call is answered with
+`BACKEND_ERROR` and never ends the daemon.
+
+The agent's in-memory replica state is lost on restart, so each reconcile first
+sweeps: a running container whose ownership marker names this node and a `job:`
+operation, but whose replica is absent from the snapshot, is stopped and
+removed. Engine containers (`launch:` operations) are not touched. A replica
+that is listed with desired phase `Stopped` resolves its container from the
+journal and stops it. The helper only stops, removes or reads logs of a
+container that carries an ownership marker.
+
+### 25.3 Safety
+
+`policy.jobs_enabled` is off by default and is separate from
+`management_enabled`. With it on, a job must match `allowed_job_image_digests`,
+unless `job_allow_any_image` is set, and `allowed_job_registries` when that list
+is non-empty. The agent checks the policy and the root helper checks it again,
+along with devices, the job port range, and bounded `args` and `env`. The helper
+rejects any request field that would grant host access (mounts, privileged,
+network, capabilities, devices, user).
+
+The container runs with `--cap-drop ALL`, `no-new-privileges`, a pids limit,
+bounded logs, no mounts, only its assigned GPUs, and at most one published port.
+This is container isolation, not a VM boundary: a host that accepts arbitrary
+images should be one its owner is prepared to treat that way.
+
+### 25.4 Privacy
+
+`log_tail` (at most 8 KB) is the tenant's own output and is returned only to the
+tenant's workspace. The control plane redacts image, arguments, environment and
+logs from what a node's owner can read when the job belongs to another workspace.
+
+### 25.5 Not included
+
+Volumes and datasets, job secrets, restart policies, and network isolation
+between a job and the host's LAN. No memory cap is applied unless the control
+plane sends one. Jobs use Docker's default bridge network, so they can reach the
+host's LAN.

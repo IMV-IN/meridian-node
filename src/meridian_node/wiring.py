@@ -8,6 +8,7 @@ adapters are chosen based on config and local policy.
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
 
 from .agent import Agent
@@ -89,7 +90,8 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
     node_id: str = agent.node_id
 
     from .artifacts import ArtifactStore, Fetcher
-    from .inventory import NvmlProvider
+    from .inventory import FakeNvidiaProvider, InventoryProvider, NvmlProvider
+    from .jobs import JobPolicy, JobSupervisor
     from .journal import Journal
     from .reservation import ReservationLedger
     from .supervisor import EngineSupervisor, ManifestSource
@@ -101,15 +103,20 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
     # MIG topology for parent/child exclusivity at launch (Phase 5). Best-effort:
     # a physical-only host (or missing NVML) yields an empty topology and the
     # ledger falls back to VRAM/port checks only.
-    provider = NvmlProvider()
+    provider: InventoryProvider
     try:
+        provider = NvmlProvider()
         topology = {g["device_id"]: g.get("parent_device_id") for g in provider.gpus()}
-    except Exception:
-        topology = {}
+    except Exception as e:
+        # No NVML (a CPU-only host, or the driver is down): report an empty
+        # inventory rather than fabricate GPUs (DESIGN.md 8.2). CPU jobs still run.
+        print(f"warning: GPU inventory unavailable ({e}); reporting no GPUs", file=sys.stderr)
+        provider, topology = FakeNvidiaProvider(devices=[]), {}
     ledger = ReservationLedger(
         device_capacity=policy.device_capacity_bytes,
         port_range=range(policy.port_range[0], policy.port_range[1]),
         topology=topology,
+        job_port_range=range(policy.job_port_range[0], policy.job_port_range[1]),
     )
     if config.mode == "air-gapped":
         from .local_artifacts import LocalFetcher, LocalManifestSource
@@ -140,7 +147,24 @@ def build_managed_reconciler(config: Config, agent: Agent, now=None):
         telemetry_probe=_build_telemetry_probe(),
         **sup_kwargs,
     )
-    reconciler = Reconciler(node_id, supervisor, agent.state, **sup_kwargs)
+    jobs = None
+    if config.jobs_allowed():
+        jobs = JobSupervisor(
+            node_id=node_id,
+            runtime=supervisor.runtime,
+            journal=journal,
+            reservations=ledger,
+            policy=JobPolicy(
+                enabled=True,
+                allow_any_image=policy.job_allow_any_image,
+                allowed_image_digests=frozenset(policy.allowed_job_image_digests),
+                allowed_registries=frozenset(policy.allowed_job_registries),
+                max_runtime_seconds=policy.job_max_runtime_seconds,
+            ),
+            advertise_host=policy.engine_host,
+            **sup_kwargs,
+        )
+    reconciler = Reconciler(node_id, supervisor, agent.state, jobs=jobs, **sup_kwargs)
     agent.attach_reconciler(reconciler)
     # NVML provider is the source of truth for local inventory in managed mode.
     agent.inventory = provider

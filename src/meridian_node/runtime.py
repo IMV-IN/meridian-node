@@ -26,6 +26,18 @@ class LaunchRequest:
     memory_limit_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class JobLaunchRequest:
+    job_key: str  # "<job_id>.<replica>"
+    image: str  # "<registry>/<repo>@sha256:<digest>"
+    args: tuple[str, ...]
+    env: dict[str, str]
+    device_ids: tuple[str, ...]
+    port: int  # 0 = none published
+    memory_limit_bytes: int
+    ownership_marker: str  # "<node_id>:<job_key>:<operation_id>"
+
+
 @dataclass
 class RuntimeStatus:
     runtime_id: str
@@ -52,6 +64,9 @@ class Runtime(Protocol):
     def inspect(self, runtime_id: str) -> Optional[RuntimeStatus]: ...
     def stop(self, runtime_id: str, force_after_seconds: int) -> None: ...
     def list_all(self) -> list[RuntimeStatus]: ...
+    def launch_job(self, req: JobLaunchRequest) -> str: ...
+    def logs(self, runtime_id: str, max_bytes: int) -> str: ...
+    def remove(self, runtime_id: str) -> None: ...
 
 
 @dataclass
@@ -59,6 +74,8 @@ class _FakeContainer:
     status: RuntimeStatus
     ready: bool = False
     served_model: str = ""
+    logs: str = ""
+    job: Optional[JobLaunchRequest] = None
 
 
 class FakeRuntime:
@@ -103,7 +120,37 @@ class FakeRuntime:
     def list_all(self) -> list[RuntimeStatus]:
         return [c.status for c in self._containers.values()]
 
+    def launch_job(self, req: JobLaunchRequest) -> str:
+        self._counter += 1
+        runtime_id = f"fake-{self._counter}"
+        status = RuntimeStatus(
+            runtime_id=runtime_id, alive=True, image_digest=req.image.rsplit("@", 1)[1],
+            ownership_marker=req.ownership_marker, device_ids=req.device_ids, port=req.port,
+        )
+        self._containers[runtime_id] = _FakeContainer(status=status, job=req)
+        return runtime_id
+
+    def logs(self, runtime_id: str, max_bytes: int) -> str:
+        c = self._containers.get(runtime_id)
+        return c.logs[-max_bytes:] if c else ""
+
+    def remove(self, runtime_id: str) -> None:
+        self._containers.pop(runtime_id, None)
+
     # --- test hooks -----------------------------------------------------
+    def finish(self, runtime_id: str, exit_code: int = 0, logs: str = "") -> None:
+        """A job container ran to completion."""
+        c = self._containers[runtime_id]
+        c.status.alive = False
+        c.status.exit_code = exit_code
+        c.logs += logs
+
+    def write_logs(self, runtime_id: str, text: str) -> None:
+        self._containers[runtime_id].logs += text
+
+    def job_request(self, runtime_id: str) -> Optional[JobLaunchRequest]:
+        return self._containers[runtime_id].job
+
     def crash(self, runtime_id: str, exit_code: int = 1) -> None:
         c = self._containers[runtime_id]
         c.status.alive = False
@@ -184,6 +231,22 @@ class HelperRuntime:
     def list_all(self) -> list[RuntimeStatus]:
         results = self._request("list", "list", {})["result"] or []
         return [_status_from_dict(r) for r in results]
+
+    def launch_job(self, req: JobLaunchRequest) -> str:
+        payload = {
+            "engine_id": req.job_key,  # journal owner column
+            "job_key": req.job_key, "image": req.image, "args": list(req.args), "env": req.env,
+            "device_ids": list(req.device_ids), "port": req.port,
+            "memory_limit_bytes": req.memory_limit_bytes, "ownership_marker": req.ownership_marker,
+        }
+        return str(self._request(f"launch_job:{req.ownership_marker}", "launch_job", payload)["result"])
+
+    def logs(self, runtime_id: str, max_bytes: int) -> str:
+        result = self._request(f"logs:{runtime_id}", "logs", {"runtime_id": runtime_id, "max_bytes": max_bytes})
+        return str(result.get("result") or "")
+
+    def remove(self, runtime_id: str) -> None:
+        self._request(f"remove:{runtime_id}", "remove", {"runtime_id": runtime_id})
 
 
 def _status_from_dict(d: dict) -> RuntimeStatus:

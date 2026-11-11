@@ -27,3 +27,14 @@ policy:
     "GPU-00000000-0000-0000-0000-000000000000": 8589934592
   engine_host: 10.0.0.5              # private interface engines bind to
   helper_socket_path: /run/meridian-node/helper.sock
+  # --- Batch jobs and services (DESIGN.md 25). Off by default. -----------------
+  # A job runs a tenant-supplied container with its own arguments, so turning
+  # this on is the host owner's decision.
+  jobs_enabled: false
+  # Image digests jobs may run...
+  allowed_job_image_digests: []
+  # ...or accept any digest-pinned image (a marketplace host renting whole GPUs).
+  job_allow_any_image: false
+  allowed_job_registries: []         # empty = any registry
+  job_port_range: [9000, 9100]
+  job_max_runtime_seconds: 0         # 0 = no host-side ceiling

@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+from .jobs import JobSupervisor, rejected_observations
 from .models import Assignment, DesiredPhase, DesiredSnapshot, EnginePhase
 from .state import StateStore
 from .supervisor import EngineSupervisor
@@ -22,11 +23,16 @@ def _utcnow() -> datetime:
 
 
 class Reconciler:
-    def __init__(self, node_id: str, supervisor: EngineSupervisor, state: StateStore, now=_utcnow):
+    def __init__(
+        self, node_id: str, supervisor: EngineSupervisor, state: StateStore, now=_utcnow,
+        jobs: Optional[JobSupervisor] = None,
+    ):
         self.node_id = node_id
         self.supervisor = supervisor
         self.state = state
         self.now = now
+        # None = this host does not run jobs; requested replicas are reported Failed.
+        self.jobs = jobs
         self._last_assignments: dict[str, Assignment] = {}
 
     def apply(self, snapshot: DesiredSnapshot, stop_authorized: Optional[set[str]] = None) -> dict:
@@ -58,8 +64,21 @@ class Reconciler:
             if self.supervisor.state(eid).phase != EnginePhase.STOPPED:
                 self._last_assignments[eid] = assignment  # keep draining until stopped
 
+        if self.jobs is not None:
+            self.jobs.fencing_epoch = self.supervisor.fencing_epoch
+            self.jobs.reconcile(snapshot.jobs_by_key())
+
         self.state.set_accepted_generation(snapshot.generation)
-        return self._observation(snapshot.generation, effective)
+        observation = self._observation(snapshot.generation, effective)
+        if self.jobs is not None:
+            observation["jobs"] = self.jobs.observations()
+            observation["capacity"].update(self.jobs.capacity())
+        else:
+            observation["jobs"] = rejected_observations(
+                snapshot.jobs, "JobsDisabled", "jobs are disabled by this host's policy", self.now
+            )
+            observation["capacity"]["jobs_enabled"] = False
+        return observation
 
     def _synthetic_stop(self, assignment: Assignment) -> Assignment:
         return assignment.model_copy(update={"desired_phase": DesiredPhase.STOPPED})

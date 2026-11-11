@@ -2,6 +2,20 @@
 
 ## 0.1.0 (unreleased)
 
+- **Batch jobs and services (DESIGN.md 25).** The agent runs digest-pinned
+  containers to completion (`job`) or until stopped (`service`), next to engines.
+  Off unless `policy.jobs_enabled` is set. A job is launched at most once, even
+  across an agent restart; it holds its GPUs exclusively through the reservation
+  ledger; the root helper re-checks image, devices, port, arguments and
+  environment and runs the container with no host mounts and no capabilities.
+  `contracts/v1` gains an optional `jobs` list on desired and observed state.
+  Launches run off the tick (phase `Starting` covers the image pull), a
+  restarted agent stops job containers it no longer tracks, and the helper
+  survives a failing `docker run` and only touches containers it launched.
+- A freshly enrolled managed node now reports its capacity before anything is
+  assigned to it, and a host without NVML reports an empty inventory instead of
+  failing to start.
+
 - **Python 3.14 everywhere.** The agent image moves to
   `python:3.14-slim-trixie` and `.python-version` pins 3.14 for local
   development. Supported range is now **3.11 – 3.14**
