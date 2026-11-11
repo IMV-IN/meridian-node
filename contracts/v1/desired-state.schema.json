@@ -35,9 +35,15 @@
           "pattern": "@sha256:[0-9a-f]{64}$"
         },
         "args": {"type": "array", "maxItems": 256, "items": {"type": "string", "maxLength": 8192}},
-        "env": {"type": "object", "maxProperties": 128, "additionalProperties": {"type": "string", "maxLength": 8192}},
+        "env": {
+          "description": "Names NVIDIA_* (except NVIDIA_TF32_OVERRIDE), CUDA_VISIBLE_DEVICES and CUDA_MPS_* are reserved: the node sets GPU visibility. Values carry no NUL, CR or LF. A replica that breaks these rules is reported Failed/InvalidSpec.",
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$"},
+          "additionalProperties": {"type": "string", "maxLength": 8192}
+        },
         "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}},
-        "memory_limit_bytes": {"type": "integer", "minimum": 0},
+        "memory_limit_bytes": {"description": "0 = the host's policy default cap. Above the host's maximum, the replica fails.", "type": "integer", "minimum": 0},
         "port": {"type": "integer", "minimum": 0, "maximum": 65535},
         "timeout_seconds": {"type": "integer", "minimum": 0},
         "desired_phase": {"type": "string", "enum": ["Running", "Draining", "Stopped"]}

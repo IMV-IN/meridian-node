@@ -21,17 +21,34 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from .journal import COMMITTED, OBSERVED, PLANNED, STARTED, Journal, JournalConflict
-from .models import JOB_TERMINAL, DesiredPhase, JobAssignment, JobPhase
+from .models import JOB_TERMINAL, DesiredPhase, InvalidJob, JobAssignment, JobPhase, url_host, valid_host
 from .reservation import ReservationError, ReservationLedger
 from .runtime import JobLaunchRequest, Runtime
 
 LOG_TAIL_BYTES = 8192
+# NUL and lone surrogates (undecodable bytes) are not text: shown as U+FFFD.
+_NOT_TEXT = re.compile("[\x00\ud800-\udfff]")
+# Bounds of what the node reports per replica (contracts/v1 observed-state).
+REASON_BYTES = 256
+MESSAGE_BYTES = 1024
+
+
+def bounded_text(text: str, max_bytes: int, keep: str = "tail") -> str:
+    """At most `max_bytes` of valid UTF-8, cut on a character boundary. Invalid
+    sequences and NUL become U+FFFD; nothing else is removed (the console and
+    CLI escape on display). `keep` picks the end that survives a cut."""
+    data = _NOT_TEXT.sub("\ufffd", text).encode("utf-8")
+    if len(data) > max_bytes:
+        data = data[-max_bytes:] if keep == "tail" else data[:max_bytes]
+    # "ignore" only drops the partial character left at the cut.
+    return data.decode("utf-8", "ignore")
 
 
 def _utcnow() -> datetime:
@@ -51,11 +68,14 @@ class JobPolicy:
     allowed_image_digests: frozenset[str] = frozenset()
     allowed_registries: frozenset[str] = frozenset()
     max_runtime_seconds: int = 0
+    max_memory_bytes: int = 256 * 1024**3
 
     def check(self, job: JobAssignment) -> Optional[str]:
         """Why this job may not run here, or None if it may."""
         if not self.enabled:
             return "jobs are disabled by this host's policy"
+        if job.memory_limit_bytes > self.max_memory_bytes:
+            return f"memory limit above this host's maximum of {self.max_memory_bytes} bytes"
         if self.allowed_registries and job.registry not in self.allowed_registries:
             return f"registry not allow-listed: {job.registry}"
         if not self.allow_any_image and job.image_digest not in self.allowed_image_digests:
@@ -93,6 +113,8 @@ class JobSupervisor:
         now=_utcnow,
         executor: Optional[Executor] = None,
     ):
+        if not valid_host(advertise_host):
+            raise ValueError("advertise_host must be an IP address or a host name of at most 253 characters")
         self.node_id = node_id
         self.runtime = runtime
         self.journal = journal
@@ -300,7 +322,7 @@ class JobSupervisor:
 
     def _logs(self, runtime_id: str) -> str:
         try:
-            return self.runtime.logs(runtime_id, LOG_TAIL_BYTES)[-LOG_TAIL_BYTES:]
+            return bounded_text(self.runtime.logs(runtime_id, LOG_TAIL_BYTES), LOG_TAIL_BYTES)
         except Exception:
             return ""
 
@@ -310,10 +332,11 @@ class JobSupervisor:
         for st in self._states.values():
             endpoint = ""
             if st.kind == "service" and st.port and st.phase == JobPhase.RUNNING:
-                endpoint = f"http://{self.advertise_host}:{st.port}"
+                endpoint = f"http://{url_host(self.advertise_host)}:{st.port}"
             out.append({
                 "job_id": st.job_id, "replica": st.replica, "phase": st.phase.value,
-                "exit_code": st.exit_code, "reason": st.reason, "message": st.message,
+                "exit_code": st.exit_code, "reason": bounded_text(st.reason, REASON_BYTES, "head"),
+                "message": bounded_text(st.message, MESSAGE_BYTES, "head"),
                 "started_at": _iso(st.started_at), "finished_at": _iso(st.finished_at),
                 "endpoint": endpoint, "log_tail": st.log_tail,
             })
@@ -330,14 +353,18 @@ class JobSupervisor:
         }
 
 
-def rejected_observations(jobs: list[JobAssignment], reason: str, message: str, now=_utcnow) -> list[dict]:
+def rejected_observations(
+    jobs: Sequence[JobAssignment | InvalidJob], reason: str, message: str, now=_utcnow
+) -> list[dict]:
     """Report every requested replica as Failed when this agent cannot run jobs
     at all, so the control plane never waits on a host that will not start them."""
     stamp = _iso(now())
     return [
         {
             "job_id": j.job_id, "replica": j.replica, "phase": JobPhase.FAILED.value, "exit_code": None,
-            "reason": reason, "message": message, "started_at": None, "finished_at": stamp,
+            "reason": bounded_text(reason, REASON_BYTES, "head"),
+            "message": bounded_text(message, MESSAGE_BYTES, "head"),
+            "started_at": None, "finished_at": stamp,
             "endpoint": "", "log_tail": "",
         }
         for j in jobs

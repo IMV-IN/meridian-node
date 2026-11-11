@@ -54,4 +54,9 @@ class Metrics:
 
 
 def _fmt(labels: tuple) -> str:
-    return ",".join(f'{k}="{v}"' for k, v in labels)
+    return ",".join(f'{k}="{_escape(str(v))}"' for k, v in labels)
+
+
+def _escape(value: str) -> str:
+    """Prometheus text format: backslash, double quote and newline are escaped in label values."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")

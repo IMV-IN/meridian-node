@@ -79,14 +79,20 @@ def _run_helper(config: Config) -> int:
         allowed_image_digests=frozenset(p.allowed_image_digests),
         allowed_devices=frozenset(p.device_capacity_bytes),
         port_start=p.port_range[0], port_stop=p.port_range[1],
-        allowed_mount_roots=(str(config.state_dir),),
+        # Only the verified-artifact cache: never the state dir with the node key and journals.
+        allowed_mount_roots=(str(config.state_dir / "artifacts" / "artifacts" / "sha256"),),
         jobs_enabled=p.jobs_enabled,
         job_allow_any_image=p.job_allow_any_image,
         allowed_job_image_digests=frozenset(p.allowed_job_image_digests),
         allowed_job_registries=frozenset(p.allowed_job_registries),
         job_port_start=p.job_port_range[0], job_port_stop=p.job_port_range[1],
+        job_bind_address=p.effective_job_bind_address,
+        job_memory_default_bytes=p.job_memory_default_bytes,
+        job_memory_max_bytes=p.job_memory_max_bytes,
+        job_cpus=p.job_cpus,
     )
-    backend = DockerContainerBackend(image_repos={})  # repos supplied by deployment
+    # Job env files go next to the socket: the helper's RuntimeDirectory, a root-owned tmpfs.
+    backend = DockerContainerBackend(image_repos={}, env_dir=os.path.dirname(p.helper_socket_path))
     server = HelperServer(backend, Journal(config.state_dir / "helper.db"), policy)
     print(f"helper listening on {p.helper_socket_path}", file=sys.stderr)
     serve_unix_socket(server, p.helper_socket_path)

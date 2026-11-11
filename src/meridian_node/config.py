@@ -6,10 +6,13 @@ must fail closed with an actionable error.
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from .models import valid_host
 
 MODES = ("observe-only", "managed-host", "kubernetes-integrated", "air-gapped")
 
@@ -51,6 +54,15 @@ class Policy(BaseModel):
     job_port_range: list[int] = Field(default=[9000, 9100])  # [start, stop)
     # Hard ceiling on one job's runtime on this host; 0 = no host-side ceiling.
     job_max_runtime_seconds: int = Field(default=0, ge=0)
+    # IP address published job ports bind to. Empty = engine_host, the address
+    # the node advertises (which must then be an IP literal). Never all
+    # interfaces unless set to 0.0.0.0 on purpose (DESIGN.md 25.3).
+    job_bind_address: str = ""
+    # Memory cap for a job that asks for none, and the largest cap a job may ask for.
+    job_memory_default_bytes: int = Field(default=32 * 1024**3, gt=0)
+    job_memory_max_bytes: int = Field(default=256 * 1024**3, gt=0)
+    # CPUs one job container may use (docker --cpus); 0 = no limit.
+    job_cpus: float = Field(default=0.0, ge=0)
 
     @field_validator("port_range", "job_port_range")
     @classmethod
@@ -58,6 +70,38 @@ class Policy(BaseModel):
         if len(v) != 2 or v[0] >= v[1]:
             raise ValueError(f"port ranges must be [start, stop) with start < stop, got {v}")
         return v
+
+    @field_validator("job_bind_address")
+    @classmethod
+    def _valid_bind_address(cls, v: str) -> str:
+        if v:
+            ipaddress.ip_address(v)  # ValueError: "... does not appear to be an IPv4 or IPv6 address"
+        return v
+
+    @field_validator("engine_host")
+    @classmethod
+    def _valid_engine_host(cls, v: str) -> str:
+        if not valid_host(v):
+            raise ValueError("engine_host must be an IP address or a host name of at most 253 characters")
+        return v
+
+    @model_validator(mode="after")
+    def _job_limits(self) -> "Policy":
+        if self.job_memory_default_bytes > self.job_memory_max_bytes:
+            raise ValueError("job_memory_default_bytes must not exceed job_memory_max_bytes")
+        if self.jobs_enabled:
+            try:
+                ipaddress.ip_address(self.effective_job_bind_address)
+            except ValueError:
+                raise ValueError(
+                    "jobs need an IP address to publish ports on: set policy.job_bind_address "
+                    "(engine_host is not an IP address)"
+                ) from None
+        return self
+
+    @property
+    def effective_job_bind_address(self) -> str:
+        return self.job_bind_address or self.engine_host
 
 
 class AirGapConfig(BaseModel):
