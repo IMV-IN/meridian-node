@@ -158,7 +158,13 @@ class Agent:
         }
         resp = self.transport.establish_session(self.node_id, request)
         self.fencing_epoch = resp["fencing_epoch"]
+        self._bind_session()
         return self.fencing_epoch
+
+    def _bind_session(self) -> None:
+        """Hand the current session to the reconciler (and through it the helper)."""
+        if self.reconciler is not None and self.fencing_epoch is not None:
+            self.reconciler.bind_session(self.transport, self.session_id, self.fencing_epoch)
 
     # --- heartbeat ------------------------------------------------------
     def heartbeat_once(self) -> dict:
@@ -192,6 +198,7 @@ class Agent:
         if self.config.mode not in ("managed-host", "air-gapped"):
             raise ValueError(f"reconciler requires an engine-launching mode, not {self.config.mode!r}")
         self.reconciler = reconciler
+        self._bind_session()
 
     def attach_observer(self, observer) -> None:
         """Enable read-only engine observation (kubernetes-integrated mode). The
@@ -229,6 +236,7 @@ class Agent:
         else:
             return resp
         stop_authorized = set(resp.get("stop_authorized_engine_ids", []))
+        self._bind_session()  # the transport may have been replaced (certificate rotation)
         observation = self.reconciler.apply(snapshot, stop_authorized=stop_authorized)
         observation["agent_session_id"] = self.session_id
         observation["sequence"] = self.state.last_sequence()

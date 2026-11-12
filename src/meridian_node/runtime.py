@@ -67,6 +67,7 @@ class Runtime(Protocol):
     def launch_job(self, req: JobLaunchRequest) -> str: ...
     def logs(self, runtime_id: str, max_bytes: int) -> str: ...
     def remove(self, runtime_id: str) -> None: ...
+    def refresh_epoch(self, epoch: int) -> None: ...
 
 
 @dataclass
@@ -85,6 +86,10 @@ class FakeRuntime:
     def __init__(self):
         self._containers: dict[str, _FakeContainer] = {}
         self._counter = 0
+        self.fencing_epoch = 0
+
+    def refresh_epoch(self, epoch: int) -> None:
+        self.fencing_epoch = epoch
 
     def launch(self, req: LaunchRequest) -> EngineHandle:
         self._counter += 1
@@ -247,6 +252,12 @@ class HelperRuntime:
 
     def remove(self, runtime_id: str) -> None:
         self._request(f"remove:{runtime_id}", "remove", {"runtime_id": runtime_id})
+
+    def refresh_epoch(self, epoch: int) -> None:
+        """Tell the helper the epoch of a newly established session. It rejects
+        every request with an older one from then on (DESIGN.md 14.1)."""
+        self.fencing_epoch = epoch
+        self._request(f"epoch:{epoch}", "refresh_epoch", {})
 
 
 def _status_from_dict(d: dict) -> RuntimeStatus:

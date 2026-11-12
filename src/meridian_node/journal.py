@@ -85,6 +85,10 @@ class Journal:
     def inspect(self, operation_id: str) -> Optional[JournalRow]:
         return self._get(operation_id)
 
+    def highest_epoch(self) -> int:
+        """The highest fencing epoch any journaled operation carried (0 when empty)."""
+        return int(self._conn.execute("SELECT COALESCE(MAX(fencing_epoch), 0) FROM journal").fetchone()[0])
+
     def pending_operations(self) -> list[JournalRow]:
         """Rows that crashed mid-flight: not committed and not yet observed."""
         cur = self._conn.execute(

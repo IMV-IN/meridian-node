@@ -34,6 +34,18 @@ class Reconciler:
         # None = this host does not run jobs; requested replicas are reported Failed.
         self.jobs = jobs
         self._last_assignments: dict[str, Assignment] = {}
+        self._bound_epoch: Optional[int] = None
+
+    def bind_session(self, transport, session_id: str, fencing_epoch: int) -> None:
+        """Adopt the agent's current session. On a new epoch the helper learns it
+        first, so it rejects every request still carrying an older one (DESIGN.md
+        14.1). If the helper cannot be told, this raises and nothing is mutated."""
+        if fencing_epoch != self._bound_epoch:
+            self.supervisor.runtime.refresh_epoch(fencing_epoch)
+            self._bound_epoch = fencing_epoch
+        self.supervisor.fencing_epoch = fencing_epoch
+        if self.jobs is not None:
+            self.jobs.bind_session(transport, session_id, fencing_epoch)
 
     def apply(self, snapshot: DesiredSnapshot, stop_authorized: Optional[set[str]] = None) -> dict:
         if snapshot.node_id != self.node_id:

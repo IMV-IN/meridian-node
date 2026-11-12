@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from .control import Transport
 from .journal import COMMITTED, OBSERVED, PLANNED, STARTED, Journal, JournalConflict
 from .models import JOB_TERMINAL, DesiredPhase, InvalidJob, JobAssignment, JobPhase, url_host, valid_host
 from .reservation import ReservationError, ReservationLedger
@@ -123,6 +124,8 @@ class JobSupervisor:
         self.advertise_host = advertise_host
         self.now = now
         self.fencing_epoch = 0
+        self.session_id = ""
+        self.transport: Optional[Transport] = None
         self._states: dict[str, JobState] = {}
         # `docker run` pulls the image first, which can take minutes. Launches run here so a
         # tick (heartbeat included) never waits on one; tests pass a synchronous executor.
@@ -131,6 +134,10 @@ class JobSupervisor:
 
     def state(self, key: str) -> Optional[JobState]:
         return self._states.get(key)
+
+    def bind_session(self, transport: Transport, session_id: str, fencing_epoch: int) -> None:
+        """The agent's current control-plane session (Reconciler.bind_session)."""
+        self.transport, self.session_id, self.fencing_epoch = transport, session_id, fencing_epoch
 
     # --- reconcile ------------------------------------------------------
     def reconcile(self, desired: dict[str, JobAssignment]) -> None:

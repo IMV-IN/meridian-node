@@ -106,7 +106,9 @@ class HelperServer:
         self.backend = backend
         self.journal = journal
         self.policy = policy
-        self.highest_epoch = 0
+        # The fence survives a helper restart: every journaled operation, a refresh included,
+        # recorded the epoch it was accepted under (DESIGN.md 14.1).
+        self.highest_epoch = journal.highest_epoch()
         self._seen_nonces: dict[str, None] = {}  # insertion-ordered, bounded by MAX_NONCES
         # Connections are served on separate threads. The lock guards the journal and nonce set; it is
         # never held across a backend call, since `docker run` can block for minutes pulling an image.
@@ -115,15 +117,24 @@ class HelperServer:
     def refresh_epoch(self, epoch: int) -> None:
         """Agent updates the accepted epoch after session establishment. A lower
         epoch can never be restored (DESIGN.md 14.1)."""
-        if epoch < self.highest_epoch:
-            raise HelperError("STALE_EPOCH", f"epoch {epoch} < accepted {self.highest_epoch}")
-        self.highest_epoch = epoch
+        if type(epoch) is not int or epoch < 0:
+            raise HelperError("INVALID_REQUEST", "fencing_epoch must be a non-negative integer")
+        with self._lock:
+            if epoch < self.highest_epoch:
+                raise HelperError("STALE_EPOCH", f"epoch {epoch} < accepted {self.highest_epoch}")
+            op_id = f"epoch:{epoch}"
+            if self.journal.plan(op_id, _digest({"epoch": epoch}), "", epoch, "refresh_epoch") != COMMITTED:
+                self.journal.mark(op_id, COMMITTED, result=str(epoch))
+            self.highest_epoch = epoch
 
     def handle(self, request: dict) -> dict:
         for field in ("operation_id", "agent_session_id", "nonce", "fencing_epoch", "type", "payload"):
             if field not in request:
                 raise HelperError("INVALID_REQUEST", f"missing field {field}")
-        if request["fencing_epoch"] < self.highest_epoch:
+        epoch = request["fencing_epoch"]
+        if type(epoch) is not int or epoch < 0:
+            raise HelperError("INVALID_REQUEST", "fencing_epoch must be a non-negative integer")
+        if epoch < self.highest_epoch:
             raise HelperError("STALE_EPOCH", "request carries an outdated fencing epoch")
 
         payload = request["payload"]
@@ -131,6 +142,13 @@ class HelperServer:
 
         if not isinstance(payload, dict):
             raise HelperError("INVALID_REQUEST", "payload must be an object")
+
+        # The agent established a session: from now on, only this epoch or a later one is accepted.
+        if req_type == "refresh_epoch":
+            if payload:
+                raise HelperError("INVALID_REQUEST", "refresh_epoch takes no payload fields")
+            self.refresh_epoch(epoch)
+            return {"ok": True, "result": epoch}
 
         # Reads are safe to repeat: no journal, no nonce consumption.
         if req_type == "inspect":

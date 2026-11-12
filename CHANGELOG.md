@@ -2,6 +2,12 @@
 
 ## 0.1.0 (unreleased)
 
+- **Fix: the helper's fencing epoch is now raised in production (DESIGN.md 14.1).** Nothing outside the tests
+  called `refresh_epoch`, so the helper accepted any epoch and `STALE_EPOCH` never fired. When a session is
+  established (and when the reconciler is attached), the agent now sends a `refresh_epoch` request; the helper
+  journals the epoch, restores it after a restart, and refuses any request carrying an older or malformed one.
+  The agent's own journal records the session epoch too, where it recorded 0 before.
+
 - **Release workflow.** Pushing a `v*` tag (or a manual dispatch) builds the agent image for linux/amd64 and
   linux/arm64 and pushes `ghcr.io/<owner>/meridian-node:{version,latest}`, and `<DOCKERHUB_USERNAME>/meridian-node`
   too when the Docker Hub secrets are set. The tag must match the `pyproject.toml` version. The wheel and sdist are
