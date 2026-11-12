@@ -1,0 +1,29 @@
+{
+  "node_id": "node_01J000000000000000000000",
+  "agent_session_id": "session_01J000000000000000000000",
+  "sequence": 1843,
+  "observed_generation": 43,
+  "engines": [],
+  "conditions": [],
+  "jobs": [
+    {
+      "job_id": "job_0123456789abcdef0123",
+      "replica": 0,
+      "phase": "Starting",
+      "exit_code": null,
+      "reason": "",
+      "message": "",
+      "started_at": "2026-11-12T10:00:00Z",
+      "finished_at": null,
+      "endpoint": "",
+      "log_tail": "",
+      "task": {"stage": "fetching"}
+    }
+  ],
+  "capacity": {
+    "allocatable_vram_bytes": {"GPU-fake-0": 0},
+    "jobs_enabled": true,
+    "advertise_host": "10.0.0.5",
+    "task_protocols": [1]
+  }
+}

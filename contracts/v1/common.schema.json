@@ -55,7 +55,9 @@
                 "STALE_AGENT_SESSION", "LOWER_GENERATION", "CONFLICT",
                 "NODE_NOT_FOUND", "GENERATION_NOT_FOUND",
                 "RATE_LIMITED", "CONTROL_UNAVAILABLE",
-                "PENDING_APPROVAL", "CLAIM_DENIED"
+                "PENDING_APPROVAL", "CLAIM_DENIED",
+                "TASKS_DISABLED", "NOT_ASSIGNED", "DIGEST_MISMATCH", "TOO_LARGE",
+                "TASK_FINISHED", "BLOB_UNAVAILABLE", "UNSUPPORTED_MEDIA_TYPE"
               ]
             },
             "message": {"type": "string", "maxLength": 1024},

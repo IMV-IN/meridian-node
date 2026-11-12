@@ -21,13 +21,28 @@
   },
   "$defs": {
     "job": {
+      "description": "A job, service or task replica. `task` is present if and only if `kind` is \"task\"; a task's `port` is 0 and its `args` are the fixed runner command (docs/COMPUTE_TASKS_NODE.md).",
       "type": "object",
       "additionalProperties": false,
       "required": ["job_id", "replica", "kind", "image"],
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "task"}}, "required": ["kind"]},
+          "then": {
+            "required": ["task"],
+            "properties": {
+              "port": {"const": 0},
+              "args": {"const": ["python3", "-I", "-B", "/meridian/in/bundle/runner/meridian_runner.py"]}
+            }
+          },
+          "else": {"not": {"required": ["task"]}}
+        }
+      ],
       "properties": {
         "job_id": {"$ref": "common.schema.json#/$defs/opaque_id"},
         "replica": {"type": "integer", "minimum": 0},
-        "kind": {"type": "string", "enum": ["job", "service"]},
+        "kind": {"type": "string", "enum": ["job", "service", "task"]},
+        "task": {"$ref": "#/$defs/task"},
         "image": {
           "description": "Digest-pinned image reference: <registry>/<repo>@sha256:<digest>",
           "type": "string",
@@ -48,6 +63,49 @@
         "timeout_seconds": {"type": "integer", "minimum": 0},
         "desired_phase": {"type": "string", "enum": ["Running", "Draining", "Stopped"]}
       }
+    },
+    "task": {
+      "description": "A remote Python function call (Compute tasks, phase 1). The node fetches the bundle and payload by job_id and replica, verifies them against these digests and sizes, and runs the fixed runner command. Sent only to nodes whose capacity advertises task_protocols containing `protocol`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "bundle", "payload", "entry"],
+      "properties": {
+        "protocol": {"type": "integer", "minimum": 1},
+        "bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["digest", "size_bytes"],
+          "properties": {
+            "digest": {"$ref": "common.schema.json#/$defs/digest"},
+            "size_bytes": {"type": "integer", "minimum": 1, "maximum": 20971520}
+          }
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["digest", "size_bytes"],
+          "properties": {
+            "digest": {"$ref": "common.schema.json#/$defs/digest"},
+            "size_bytes": {"type": "integer", "minimum": 1, "maximum": 262144}
+          }
+        },
+        "entry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["module", "qualname"],
+          "properties": {
+            "module": {"$ref": "#/$defs/entry_name"},
+            "qualname": {"$ref": "#/$defs/entry_name"}
+          }
+        },
+        "client_python": {"type": "string", "pattern": "^(3\\.[0-9]{1,2})?$"}
+      }
+    },
+    "entry_name": {
+      "description": "Dotted Python identifier path, ASCII only, at most 200 characters. No component may match ^__.*__$ (checked in code; not expressible here).",
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}(\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,15}$"
     },
     "assignment": {
       "type": "object",

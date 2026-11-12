@@ -1,0 +1,34 @@
+{
+  "node_id": "node_01J000000000000000000000",
+  "generation": 43,
+  "snapshot_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+  "assignments": [],
+  "jobs": [
+    {
+      "job_id": "job_0123456789abcdef0123",
+      "replica": 0,
+      "kind": "task",
+      "image": "docker.io/pytorch/pytorch@sha256:77f17f843507062875ce8be2a6f76aa6aa3df7f9ef1e31d9d7432f4b0f563dee",
+      "args": ["python3", "-I", "-B", "/meridian/in/bundle/runner/meridian_runner.py"],
+      "env": {
+        "HOME": "/tmp",
+        "MERIDIAN_JOB_ID": "job_0123456789abcdef0123",
+        "MERIDIAN_JOB_NAME": "thesis/fit",
+        "MERIDIAN_JOB_RANK": "0",
+        "MERIDIAN_JOB_REPLICAS": "1"
+      },
+      "device_ids": ["GPU-fake-0"],
+      "memory_limit_bytes": 0,
+      "port": 0,
+      "timeout_seconds": 3600,
+      "desired_phase": "Running",
+      "task": {
+        "protocol": 1,
+        "bundle": {"digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666", "size_bytes": 81234},
+        "payload": {"digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "size_bytes": 57},
+        "entry": {"module": "train", "qualname": "fit"},
+        "client_python": "3.12"
+      }
+    }
+  ]
+}

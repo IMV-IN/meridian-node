@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridian.dev/contracts/v1/task-manifest.schema.json",
+  "title": "Task manifest: /meridian/in/task.json",
+  "description": "Written by the node agent with json.dumps from the validated desired-state `task` fields, at most 4096 bytes, mode 0644. Read by the runner inside the container, which re-validates it (docs/COMPUTE_TASKS_NODE.md). The node never reads it back.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "job_id", "entry", "client_python"],
+  "properties": {
+    "protocol": {"type": "integer", "const": 1},
+    "job_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "qualname"],
+      "properties": {
+        "module": {"$ref": "desired-state.schema.json#/$defs/entry_name"},
+        "qualname": {"$ref": "desired-state.schema.json#/$defs/entry_name"}
+      }
+    },
+    "client_python": {"type": "string", "pattern": "^(3\\.[0-9]{1,2})?$"}
+  }
+}

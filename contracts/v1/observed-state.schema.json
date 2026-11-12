@@ -33,8 +33,17 @@
     },
     "conditions": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/condition"}},
     "capacity": {
-      "description": "Allocatable capacity and placement signals (VRAM per device, ports, held artifacts, jobs_enabled, advertise_host).",
-      "type": "object"
+      "description": "Allocatable capacity and placement signals (VRAM per device, ports, held artifacts, jobs_enabled, advertise_host). An open object; task_protocols is typed because placement depends on it.",
+      "type": "object",
+      "properties": {
+        "task_protocols": {
+          "description": "Task protocol versions this node runs. Present only when policy.jobs_enabled and policy.tasks_enabled are both true. Absent or empty: the control plane never places a task here.",
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1, "maximum": 1000}
+        }
+      }
     },
     "jobs": {
       "description": "Batch job and service replicas (DESIGN.md 25). log_tail is the last output of the tenant's own container.",
@@ -53,7 +62,16 @@
           "started_at": {"type": ["string", "null"]},
           "finished_at": {"type": ["string", "null"]},
           "endpoint": {"type": "string", "maxLength": 512},
-          "log_tail": {"type": "string", "maxLength": 8192}
+          "log_tail": {"type": "string", "maxLength": 8192},
+          "task": {
+            "description": "Progress of a task replica (kind \"task\"). Display only: the phase decides the outcome, and the result travels only through the result upload endpoint.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["stage"],
+            "properties": {
+              "stage": {"type": "string", "enum": ["fetching", "launching", "running", "collecting", "uploading", "done"]}
+            }
+          }
         }
       }
     }
