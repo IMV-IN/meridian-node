@@ -9,7 +9,7 @@ faithfully.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import IO, Protocol
 
 
 class ControlError(Exception):
@@ -49,4 +49,20 @@ class Transport(Protocol):
     def rotate_certificate(self, node_id: str) -> dict:
         """POST /control/v1/nodes/{node_id}/certificate. Returns a fresh cert for
         the node's registered public key (Phase 4 cert rotation)."""
+        ...
+
+    def fetch_task_blob(
+        self, node_id: str, job_id: str, replica: int, kind: str, dest: IO[bytes], max_bytes: int,
+        session_id: str, epoch: int,
+    ) -> tuple[str, int]:
+        """GET .../tasks/{job_id}/replicas/{replica}/{bundle|payload}, streamed into `dest`.
+        Aborts past `max_bytes`. Returns ("sha256:<hex>", size) of the bytes written
+        (docs/COMPUTE_TASKS_NODE.md 3.4). A size or header that disagrees is DIGEST_MISMATCH."""
+        ...
+
+    def upload_task_result(
+        self, node_id: str, job_id: str, replica: int, kind: str, data: bytes, digest: str,
+        session_id: str, epoch: int,
+    ) -> dict:
+        """PUT .../tasks/{job_id}/replicas/{replica}/result?kind={result|error}."""
         ...

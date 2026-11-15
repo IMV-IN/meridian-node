@@ -12,10 +12,15 @@ around it.
 
 from __future__ import annotations
 
+import base64
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
+import stat
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +28,13 @@ from typing import Optional, Protocol
 
 from .journal import COMMITTED, Journal
 from .models import DEVICE_ID, IMAGE_REF, JOB_ID, MAX_IMAGE_REF, job_strings_error
+from .tasks import (
+    MAX_RESULT_BYTES,
+    SUPPORTED_TASK_PROTOCOLS,
+    TASK_ARGV,
+    TASK_OUT_TMPFS_BYTES,
+    TASK_OUT_TMPFS_INODES,
+)
 
 
 class HelperError(Exception):
@@ -52,6 +64,16 @@ class HelperPolicy:
     job_memory_default_bytes: int = 32 * 1024**3  # cap for a job that asks for none
     job_memory_max_bytes: int = 256 * 1024**3  # largest cap a job may ask for
     job_cpus: float = 0.0  # 0 = no CPU limit
+    # Compute tasks (docs/COMPUTE_TASKS_NODE.md 4, 7). Off by default.
+    tasks_enabled: bool = False
+    task_uid: int = 65534
+    task_gid: int = 65534
+    task_tmp_bytes: int = 4 * 1024**3
+    task_shm_bytes: int = 1024**3
+    task_in_root: str = ""  # <state_dir>/tasks: where the agent extracts each task's inputs
+    task_out_root: str = "/var/lib/meridian-node-helper/task-out"
+    # Test only, never in config.Policy: a plain directory instead of a tmpfs mount.
+    task_out_tmpfs: bool = True
 
 
 class ContainerBackend(Protocol):
@@ -62,7 +84,7 @@ class ContainerBackend(Protocol):
     def launch(self, spec: dict) -> str: ...
     def inspect(self, runtime_id: str) -> Optional[dict]: ...
     def stop(self, runtime_id: str, force_after_seconds: int) -> None: ...
-    def list_all(self) -> list[dict]: ...
+    def list_all(self, include_exited: bool = False) -> list[dict]: ...
     def launch_job(self, spec: dict) -> str: ...
     def logs(self, runtime_id: str, max_bytes: int) -> str: ...
     def remove(self, runtime_id: str) -> None: ...
@@ -74,7 +96,12 @@ MAX_NONCES = 65536  # replay window; older nonces are forgotten first
 # new host-access knob can never be smuggled in under a name the helper ignores.
 JOB_FIELDS = frozenset({
     "engine_id", "job_key", "image", "args", "env", "device_ids", "port", "memory_limit_bytes", "ownership_marker",
+    "task",
 })
+TASK_LABEL = "dev.meridian.task"
+JOB_LABEL = "dev.meridian.job"
+COLLECT_FIELDS = frozenset({"job_key", "runtime_id"})
+RESULT_NAMES = {"result.json": "result", "error.json": "error"}
 # "<node_id>:<job_key>:<operation_id>", written into a container label.
 OWNERSHIP_MARKER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}")
 # A bind-mount source: no comma, quote, colon or '=', so it stays one field of `--mount`.
@@ -167,6 +194,8 @@ class HelperServer:
                 return {"ok": True, "result": ""}
             self._require_owned(runtime_id)
             return {"ok": True, "result": self.backend.logs(runtime_id, limit)}
+        if req_type == "collect_task_result":
+            return {"ok": True, "result": self._collect_task_result(payload)}
 
         op_id = request["operation_id"]
         digest = _digest({"type": req_type, "payload": payload})
@@ -196,7 +225,15 @@ class HelperServer:
             mount = self._validate_launch(payload)
             return self.backend.launch({**payload, "artifact_mount": mount})
         if req_type == "launch_job":
-            return self.backend.launch_job(self._validate_job(payload))
+            spec = self._validate_job(payload)
+            if "task_out_dir" not in spec:
+                return self.backend.launch_job(spec)
+            self._make_task_out(spec["job_key"])
+            try:
+                return self.backend.launch_job(spec)
+            except BaseException:
+                self._release_task_out(spec["job_key"])  # nothing runs: do not leak the mount
+                raise
         if req_type == "stop":
             runtime_id = self._runtime_id(payload)
             grace = payload.get("force_after_seconds", 30)
@@ -208,7 +245,11 @@ class HelperServer:
         if req_type == "remove":
             runtime_id = self._runtime_id(payload)
             self._require_owned(runtime_id)
+            found = self.backend.inspect(runtime_id) or {}
             self.backend.remove(runtime_id)
+            job_key = found.get("job_key")
+            if found.get("task") is True and isinstance(job_key, str) and JOB_ID.fullmatch(job_key):
+                self._release_task_out(job_key)
             return runtime_id
         raise HelperError("INVALID_REQUEST", "unknown request type")
 
@@ -270,12 +311,181 @@ class HelperServer:
         error = job_strings_error(args, env)
         if error:
             raise HelperError("POLICY_DENIED", error)
-        return {
+        spec = {
             "job_key": job_key, "ownership_marker": marker, "image": image, "args": list(args), "env": dict(env),
             "device_ids": list(devices), "port": port,
             "memory_limit_bytes": memory or p.job_memory_default_bytes,
             "cpus": p.job_cpus, "bind_address": p.job_bind_address,
         }
+        if "task" in payload:
+            spec.update(self._validate_task(payload["task"], job_key, args, port))
+        return spec
+
+    def _validate_task(self, task: object, job_key: str, args: object, port: object) -> dict:
+        """A task replica (docs/COMPUTE_TASKS_NODE.md 7.1). Both directories are
+        derived from the validated job key and the helper's own policy; the
+        request names neither."""
+        p = self.policy
+        if not p.tasks_enabled:
+            raise HelperError("POLICY_DENIED", "tasks are disabled by this host's policy")
+        if not (isinstance(task, dict) and set(task) == {"protocol"} and type(task["protocol"]) is int
+                and task["protocol"] in SUPPORTED_TASK_PROTOCOLS):
+            raise HelperError("POLICY_DENIED", "task must be exactly {\"protocol\": <supported version>}")
+        if args != list(TASK_ARGV) or port != 0:
+            raise HelperError("POLICY_DENIED", "a task runs the fixed runner command and publishes no port")
+        in_dir = self._task_in_dir(job_key)
+        return {
+            "task_in_dir": in_dir, "task_out_dir": os.path.join(self._task_out_root(), job_key),
+            "task_uid": p.task_uid, "task_gid": p.task_gid,
+            "task_tmp_bytes": p.task_tmp_bytes, "task_shm_bytes": p.task_shm_bytes,
+        }
+
+    def _task_in_dir(self, job_key: str) -> str:
+        """`<task_in_root>/<job_key>/in`, checked to be a real directory strictly
+        inside the root, holding the three files the runner needs."""
+        if not self.policy.task_in_root.startswith("/"):
+            raise HelperError("POLICY_DENIED", "task input root is not configured")
+        root = os.path.realpath(self.policy.task_in_root)
+        in_dir = os.path.join(root, job_key, "in")
+        try:
+            st = os.lstat(in_dir)
+        except OSError:
+            raise HelperError("POLICY_DENIED", "task input directory is missing") from None
+        if not stat.S_ISDIR(st.st_mode) or os.path.realpath(in_dir) != in_dir:
+            raise HelperError("POLICY_DENIED", "task input directory must be a real directory")
+        if not (Path(in_dir).is_relative_to(root) and in_dir != root) or not MOUNT_PATH.fullmatch(in_dir):
+            raise HelperError("POLICY_DENIED", "task input directory outside the task root")
+        for rel in ("args.json", "task.json", "bundle/runner/meridian_runner.py"):
+            try:
+                if not stat.S_ISREG(os.lstat(os.path.join(in_dir, rel)).st_mode):
+                    raise OSError
+            except OSError:
+                raise HelperError("POLICY_DENIED", "task input files are missing") from None
+        return in_dir
+
+    def _task_out_root(self) -> str:
+        """The out root: created 0700 if missing, then required to be a real
+        directory owned by the helper's user and closed to everyone else. A
+        misconfigured root (say /etc) is refused before anything in it is touched."""
+        root = self.policy.task_out_root
+        if not MOUNT_PATH.fullmatch(root) or ".." in root.split("/"):
+            raise HelperError("POLICY_DENIED", "task output root is not a valid absolute path")
+        try:
+            os.makedirs(root, mode=0o700, exist_ok=True)
+            st = os.lstat(root)
+        except OSError as e:
+            raise HelperError("POLICY_DENIED", f"task output root unusable ({type(e).__name__})") from None
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            raise HelperError("POLICY_DENIED", "task output root must be a 0700 directory owned by the helper")
+        return root
+
+    def _make_task_out(self, job_key: str) -> None:
+        """A fresh 2 MiB, 16-inode tmpfs owned by the task user, mounted on <out_root>/<job_key>."""
+        p = self.policy
+        out = os.path.join(self._task_out_root(), job_key)
+        if os.path.ismount(out):
+            raise HelperError("POLICY_DENIED", "stale task output")
+        if os.path.lexists(out):
+            self._discard(out)  # left by a launch that failed before a container existed
+        os.mkdir(out, 0o700)
+        if not p.task_out_tmpfs:
+            os.chown(out, p.task_uid, p.task_gid)
+            return
+        options = (
+            f"size={TASK_OUT_TMPFS_BYTES},nr_inodes={TASK_OUT_TMPFS_INODES},mode=0700,"
+            f"uid={p.task_uid},gid={p.task_gid},nosuid,nodev,noexec"
+        )
+        try:
+            self._command(["mount", "-t", "tmpfs", "-o", options, "tmpfs", "--", out])
+        except BaseException:
+            self._discard(out)
+            raise
+
+    def _release_task_out(self, job_key: str) -> None:
+        """Unmount and remove one task's output. Best effort: the startup sweep retries."""
+        out = os.path.join(self.policy.task_out_root, job_key)
+        try:
+            if os.path.ismount(out):
+                self._command(["umount", "--", out])
+            self._discard(out)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    def _discard(self, path: str) -> None:
+        """Remove an entry of the out root. In production that is an empty
+        mountpoint (rmdir) or a stray file (unlink); only the test mode's plain
+        directories can hold files, and rmtree does not follow links."""
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                if self.policy.task_out_tmpfs:
+                    os.rmdir(path)
+                else:
+                    shutil.rmtree(path)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def _command(self, argv: list[str]) -> None:
+        """mount/umount: a fixed program and an argv list, never a shell."""
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+
+    def sweep_task_out(self) -> None:
+        """Before serving (docs/COMPUTE_TASKS_NODE.md 7.4): remove every output
+        directory that no task container, running or exited, still owns."""
+        root = self.policy.task_out_root
+        if not os.path.isdir(root):
+            return
+        root = self._task_out_root()
+        owned = {
+            c.get("job_key") for c in self.backend.list_all(include_exited=True)
+            if c.get("task") is True and c.get("ownership_marker")
+        }
+        for name in os.listdir(root):
+            if JOB_ID.fullmatch(name) and name in owned:
+                continue
+            path = os.path.join(root, name)
+            try:
+                if os.path.ismount(path):
+                    self._command(["umount", "--", path])
+                self._discard(path)
+            except (OSError, subprocess.CalledProcessError):
+                pass
+
+    def _collect_task_result(self, payload: dict) -> dict:
+        """Read the one result file of an exited task (docs/COMPUTE_TASKS_NODE.md
+        7.2). The bytes are returned base64-encoded and never parsed."""
+        if set(payload) != COLLECT_FIELDS:
+            raise HelperError("INVALID_REQUEST", "collect_task_result takes exactly job_key and runtime_id")
+        job_key = payload["job_key"]
+        if not isinstance(job_key, str) or not JOB_ID.fullmatch(job_key):
+            raise HelperError("POLICY_DENIED", "invalid job key")
+        runtime_id = self._runtime_id(payload)
+        self._require_owned(runtime_id)
+        found = self.backend.inspect(runtime_id) or {}
+        if found.get("alive") is not False:
+            raise HelperError("POLICY_DENIED", "the task container is still running")
+        if found.get("task") is not True or found.get("job_key") != job_key:
+            raise HelperError("POLICY_DENIED", "the container is not this task's")
+        try:
+            out = os.path.join(self.policy.task_out_root, job_key)
+            dfd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return {"kind": "none", "reason": "ResultMissing"}
+        except OSError:
+            raise HelperError("POLICY_DENIED", "task output is not a directory") from None
+        try:
+            st = os.fstat(dfd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.policy.task_uid:
+                raise HelperError("POLICY_DENIED", "task output is not owned by the task user")
+            names = os.listdir(dfd)
+            if not names:
+                return {"kind": "none", "reason": "ResultMissing"}
+            if len(names) != 1 or names[0] not in RESULT_NAMES:
+                return {"kind": "none", "reason": "ResultInvalid"}
+            return _read_result(dfd, names[0])
+        finally:
+            os.close(dfd)
 
     def _validate_launch(self, payload: dict) -> str:
         """Check an engine launch; returns the resolved artifact mount source."""
@@ -307,6 +517,91 @@ class HelperServer:
             if real != real_root and real.is_relative_to(real_root):
                 return str(real)
         raise HelperError("POLICY_DENIED", "artifact mount outside allowed roots")
+
+
+def _read_result(dfd: int, name: str) -> dict:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        return {"kind": "none", "reason": "ResultInvalid"}  # ELOOP (a link), a device on nodev, ...
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size == 0:
+            return {"kind": "none", "reason": "ResultInvalid"}
+        if st.st_size > MAX_RESULT_BYTES:
+            return {"kind": "none", "reason": "ResultTooLarge"}
+        chunks, size = [], 0
+        while size <= MAX_RESULT_BYTES:
+            chunk = os.read(fd, MAX_RESULT_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as e:
+        if e.errno == errno.EAGAIN:
+            return {"kind": "none", "reason": "ResultInvalid"}
+        raise
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > MAX_RESULT_BYTES:
+        return {"kind": "none", "reason": "ResultTooLarge"}
+    if not data:
+        return {"kind": "none", "reason": "ResultInvalid"}
+    return {
+        "kind": RESULT_NAMES[name], "size": len(data), "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+        "data_b64": base64.b64encode(data).decode(),
+    }
+
+
+def docker_run_args(spec: dict, network: str, env_file: str) -> list[str]:
+    """The `docker run` argv for a validated job or task spec (the output of
+    HelperServer._validate_job). Pure: every value is its own element after the
+    option it belongs to, `--` ends the options, and env stays in `env_file`."""
+    args = [
+        "run", "-d", "--restart", "no",
+        "--label", f"{DockerContainerBackend.LABEL}={spec['ownership_marker']}",
+        "--label", f"{JOB_LABEL}={spec['job_key']}",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--pids-limit", "8192",
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
+        "--network", network,
+        # Swap equal to memory: the cap is not stretched by swapping. A job is
+        # the first thing the kernel kills if the host still runs out.
+        "--memory", str(spec["memory_limit_bytes"]), "--memory-swap", str(spec["memory_limit_bytes"]),
+        "--oom-score-adj", "500",
+    ]
+    if spec["cpus"]:
+        args += ["--cpus", str(spec["cpus"])]
+    if spec["device_ids"]:
+        args += ["--gpus", '"device=' + ",".join(spec["device_ids"]) + '"']
+    if spec["port"]:
+        host = spec["bind_address"]
+        host = f"[{host}]" if ":" in host else host
+        args += ["-p", f"{host}:{spec['port']}:{spec['port']}"]
+    if "task_in_dir" not in spec:
+        return args + ["--env-file", env_file, "--", spec["image"], *spec["args"]]
+    # A task: its own user, a read-only root, two fixed mounts and the fixed runner (COMPUTE_TASKS_NODE 7.1).
+    return args + [
+        "--user", f"{int(spec['task_uid'])}:{int(spec['task_gid'])}",
+        "--read-only",
+        "--tmpfs", f"/tmp:rw,nosuid,nodev,mode=1777,size={int(spec['task_tmp_bytes'])}",
+        "--shm-size", str(int(spec["task_shm_bytes"])),
+        "--mount", f"type=bind,source={spec['task_in_dir']},target=/meridian/in,readonly",
+        "--mount", f"type=bind,source={spec['task_out_dir']},target=/meridian/out",
+        "--label", f"{TASK_LABEL}=1",
+        "--env-file", env_file,
+        # Without the override an image's ENTRYPOINT (tini, an API server) would receive the runner's arguments.
+        "--entrypoint", TASK_ARGV[0],
+        "--", spec["image"], *TASK_ARGV[1:],
+    ]
+
+
+def task_run_args(spec: dict, env_file: str) -> list[str]:
+    """The argv of a task container (docs/COMPUTE_TASKS_NODE.md 7.1)."""
+    if "task_in_dir" not in spec:
+        raise ValueError("not a task spec")
+    return docker_run_args(spec, DockerContainerBackend.JOB_NETWORK, env_file)
 
 
 def unix_socket_send(socket_path: str):
@@ -435,13 +730,15 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
             "device_ids": [],
             "port": 0,
             "exit_code": data["State"].get("ExitCode"),
+            "job_key": labels.get(JOB_LABEL, ""),
+            "task": labels.get(TASK_LABEL) == "1",
         }
 
     def stop(self, runtime_id: str, force_after_seconds: int) -> None:
         self._run(["stop", "-t", str(int(force_after_seconds)), "--", runtime_id])
 
-    def list_all(self) -> list[dict]:
-        ids = self._run(["ps", "-q", "--filter", f"label={self.LABEL}"]).split()
+    def list_all(self, include_exited: bool = False) -> list[dict]:
+        ids = self._run(["ps", *(["-a"] if include_exited else []), "-q", "--filter", f"label={self.LABEL}"]).split()
         return [s for s in (self.inspect(i) for i in ids if self.RUNTIME_ID.fullmatch(i)) if s]
 
     def _job_network(self) -> str:
@@ -468,7 +765,8 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
         return self.JOB_NETWORK
 
     def launch_job(self, spec: dict) -> str:
-        """Run a tenant container with no host access: no mounts, no added
+        """Run a tenant container with no host access: no mounts (a task gets
+        exactly its read-only input and its small output tmpfs), no added
         capabilities, no privilege escalation, bounded processes and memory, its
         own network with no path to other jobs' containers, only its assigned
         GPUs and, optionally, one port published on the policy's bind address.
@@ -478,35 +776,14 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
         HelperServer._validate_job."""
         import tempfile
 
-        args = [
-            "run", "-d", "--restart", "no",
-            "--label", f"{self.LABEL}={spec['ownership_marker']}",
-            "--label", f"dev.meridian.job={spec['job_key']}",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            "--pids-limit", "8192",
-            "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
-            "--network", self._job_network(),
-            # Swap equal to memory: the cap is not stretched by swapping. A job is
-            # the first thing the kernel kills if the host still runs out.
-            "--memory", str(spec["memory_limit_bytes"]), "--memory-swap", str(spec["memory_limit_bytes"]),
-            "--oom-score-adj", "500",
-        ]
-        if spec["cpus"]:
-            args += ["--cpus", str(spec["cpus"])]
-        if spec["device_ids"]:
-            args += ["--gpus", '"device=' + ",".join(spec["device_ids"]) + '"']
-        if spec["port"]:
-            host = spec["bind_address"]
-            host = f"[{host}]" if ":" in host else host
-            args += ["-p", f"{host}:{spec['port']}:{spec['port']}"]
+        network = self._job_network()
         # Platform values last and merged over the job's own: they always win.
         env = {**spec["env"], **gpu_env(spec["device_ids"])}
         fd, env_file = tempfile.mkstemp(prefix="meridian-job-env-", dir=self.env_dir)  # mode 0600
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.writelines(f"{k}={v}\n" for k, v in env.items())
-            args += ["--env-file", env_file, "--", spec["image"], *spec["args"]]
-            return self._run(args)
+            return self._run(docker_run_args(spec, network, env_file))
         finally:
             os.unlink(env_file)  # `docker run -d` has read it and started the container
 
@@ -523,11 +800,15 @@ class DockerContainerBackend:  # pragma: no cover - requires a Docker host (DESI
 
 
 class FakeContainerBackend:
-    """In-memory backend for helper protocol tests."""
+    """In-memory backend for helper protocol tests. With `run_tasks`, launching
+    a task runs its runner as a local subprocess, synchronously (the cross-repo
+    e2e test; docs/COMPUTE_TASKS_NODE.md 8)."""
 
     RUNTIME_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # Docker's container-name grammar
+    TASK_TIMEOUT_SECONDS = 60
 
-    def __init__(self):
+    def __init__(self, run_tasks: bool = False):
+        self.run_tasks = run_tasks
         self._c: dict[str, dict] = {}
         self._n = 0
         self.job_specs: dict[str, dict] = {}
@@ -551,7 +832,7 @@ class FakeContainerBackend:
             self._c[runtime_id]["alive"] = False
             self._c[runtime_id]["exit_code"] = 0
 
-    def list_all(self) -> list[dict]:
+    def list_all(self, include_exited: bool = False) -> list[dict]:
         return list(self._c.values())
 
     def launch_job(self, spec: dict) -> str:
@@ -561,9 +842,27 @@ class FakeContainerBackend:
             "runtime_id": rid, "alive": True, "image_digest": spec["image"].rsplit("@", 1)[1],
             "ownership_marker": spec.get("ownership_marker", ""), "device_ids": spec.get("device_ids", []),
             "port": spec.get("port", 0), "exit_code": None,
+            "job_key": spec["job_key"], "task": "task_in_dir" in spec,
         }
         self.job_specs[rid] = spec
+        if self.run_tasks and "task_in_dir" in spec:
+            self._run_task(rid, spec)
         return rid
+
+    def _run_task(self, rid: str, spec: dict) -> None:
+        import sys
+
+        in_dir, out_dir = spec["task_in_dir"], spec["task_out_dir"]
+        argv = [sys.executable, "-I", "-B", f"{in_dir}/bundle/runner/meridian_runner.py", "--in", in_dir,
+                "--out", out_dir]
+        env = {**spec["env"], **gpu_env(spec["device_ids"])}
+        try:
+            r = subprocess.run(argv, env=env, capture_output=True, timeout=self.TASK_TIMEOUT_SECONDS)
+            code, output = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired as e:
+            code, output = 137, (e.stdout or b"") + (e.stderr or b"")
+        self.job_logs[rid] = output.decode("utf-8", "replace")
+        self._c[rid].update(alive=False, exit_code=code)
 
     def logs(self, runtime_id: str, max_bytes: int) -> str:
         return self.job_logs.get(runtime_id, "")[-max_bytes:]

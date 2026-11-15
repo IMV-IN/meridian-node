@@ -9,8 +9,12 @@ here matches contracts/v1 and the fake control plane.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import time
 import urllib.parse
-from typing import Callable, Optional
+from typing import IO, Callable, Optional
 
 try:
     import httpx
@@ -20,6 +24,24 @@ except ImportError as e:  # pragma: no cover - import guard
 from .control import ControlError
 
 _RETRYABLE_CODES = {"RATE_LIMITED", "CONTROL_UNAVAILABLE"}
+# Task downloads (docs/COMPUTE_TASKS_NODE.md 3.4): 30 s between reads, 300 s in all.
+TASK_READ_TIMEOUT = 30.0
+TASK_TOTAL_TIMEOUT = 300.0
+MAX_ERROR_BODY = 64 * 1024
+# Path segments are built only from values of these shapes (models.JOB_ID; node ids are opaque ids too).
+_PATH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _task_error(status: int, body: bytes) -> ControlError:
+    """The contracts/v1 error envelope of a failed task call. 5xx is always retryable."""
+    try:
+        err = json.loads(body).get("error", {})
+        code, message = str(err.get("code", "")), str(err.get("message", ""))[:256]
+    except Exception:
+        code, message = "", ""
+    code = code or ("CONTROL_UNAVAILABLE" if status >= 500 else f"HTTP_{status}")
+    return ControlError(code, message or f"HTTP {status}", retryable=status >= 500 or code in _RETRYABLE_CODES)
 
 
 def _raise_for_envelope(resp: "httpx.Response") -> dict:
@@ -110,6 +132,75 @@ class HttpTransport:
             self._url(f"/control/v1/nodes/{node_id}/certificate"), headers=self._auth
         )
         return _raise_for_envelope(resp)
+
+    def _task_url(self, node_id: str, job_id: str, replica: int, tail: str) -> str:
+        if not (isinstance(node_id, str) and _PATH_ID.fullmatch(node_id) and isinstance(job_id, str)
+                and _PATH_ID.fullmatch(job_id) and type(replica) is int and replica >= 0):
+            raise ValueError("invalid task path segment")
+        return self._url(f"/control/v1/nodes/{node_id}/tasks/{job_id}/replicas/{replica}/{tail}")
+
+    def _task_headers(self, session_id: str, epoch: int) -> dict[str, str]:
+        if not isinstance(session_id, str) or not _PATH_ID.fullmatch(session_id) or type(epoch) is not int:
+            raise ValueError("invalid session")
+        return {**self._auth, "X-Meridian-Agent-Session": session_id, "X-Meridian-Fencing-Epoch": str(epoch)}
+
+    def fetch_task_blob(
+        self, node_id: str, job_id: str, replica: int, kind: str, dest: IO[bytes], max_bytes: int,
+        session_id: str, epoch: int,
+    ) -> tuple[str, int]:
+        if kind not in ("bundle", "payload"):
+            raise ValueError("kind must be bundle or payload")
+        url = self._task_url(node_id, job_id, replica, kind)
+        headers = self._task_headers(session_id, epoch)
+        deadline = time.monotonic() + TASK_TOTAL_TIMEOUT
+        sha, size = hashlib.sha256(), 0
+        try:
+            with self._client.stream("GET", url, headers=headers, timeout=TASK_READ_TIMEOUT) as resp:
+                if resp.status_code != 200:
+                    body = b""
+                    for chunk in resp.iter_bytes():
+                        body += chunk
+                        if len(body) > MAX_ERROR_BODY or time.monotonic() > deadline:
+                            break
+                    raise _task_error(resp.status_code, body[:MAX_ERROR_BODY])
+                length = resp.headers.get("Content-Length")
+                if length is not None and (not length.isdigit() or int(length) > max_bytes):
+                    raise ControlError("DIGEST_MISMATCH", "Content-Length disagrees with the snapshot")
+                for chunk in resp.iter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ControlError("DIGEST_MISMATCH", "more bytes than the snapshot's size_bytes")
+                    if time.monotonic() > deadline:
+                        raise ControlError("CONTROL_UNAVAILABLE", "download exceeded 300 s", retryable=True)
+                    sha.update(chunk)
+                    dest.write(chunk)
+                digest = "sha256:" + sha.hexdigest()
+                claimed = resp.headers.get("X-Meridian-Content-Digest")
+                if (claimed is not None and claimed != digest) or (length is not None and int(length) != size):
+                    raise ControlError("DIGEST_MISMATCH", "response headers disagree with the bytes")
+                return digest, size
+        except httpx.HTTPError as e:
+            raise ControlError("CONTROL_UNAVAILABLE", f"download failed: {type(e).__name__}", retryable=True) from None
+
+    def upload_task_result(
+        self, node_id: str, job_id: str, replica: int, kind: str, data: bytes, digest: str,
+        session_id: str, epoch: int,
+    ) -> dict:
+        if kind not in ("result", "error") or not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("invalid result kind or digest")
+        url = self._task_url(node_id, job_id, replica, "result")
+        headers = {
+            **self._task_headers(session_id, epoch),
+            "Content-Type": "application/octet-stream", "X-Meridian-Content-Digest": digest,
+        }
+        try:
+            resp = self._client.put(url, params={"kind": kind}, content=data, headers=headers,
+                                    timeout=TASK_READ_TIMEOUT)
+        except httpx.HTTPError as e:
+            raise ControlError("CONTROL_UNAVAILABLE", f"upload failed: {type(e).__name__}", retryable=True) from None
+        if resp.status_code in (200, 201):
+            return {"stored": resp.status_code == 201}
+        raise _task_error(resp.status_code, resp.content[:MAX_ERROR_BODY])
 
     def close(self) -> None:
         self._client.close()

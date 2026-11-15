@@ -14,6 +14,16 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from .tasks import (
+    CLIENT_PYTHON,
+    MAX_BUNDLE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    SUPPORTED_TASK_PROTOCOLS,
+    TASK_ARGV,
+    digest_ok,
+    entry_name_ok,
+)
+
 
 class EnginePhase(str, Enum):
     PENDING = "Pending"
@@ -200,6 +210,60 @@ def url_host(host: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
+class BlobRef(BaseModel):
+    """A bundle or payload the node fetches by replica, identified by digest and size."""
+
+    model_config = {"extra": "forbid"}
+    digest: str
+    size_bytes: int = Field(ge=1)
+
+    @field_validator("digest")
+    @classmethod
+    def _digest(cls, v: str) -> str:
+        if not digest_ok(v):
+            raise ValueError("digest must be sha256:<64 lowercase hex>")
+        return v
+
+
+class TaskEntry(BaseModel):
+    model_config = {"extra": "forbid"}
+    module: str
+    qualname: str
+
+    @field_validator("module", "qualname")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        if not entry_name_ok(v):
+            raise ValueError("entry names must be dotted ASCII Python identifiers without dunder components")
+        return v
+
+
+class TaskSpec(BaseModel):
+    """The `task` object of a task replica (docs/COMPUTE_TASKS_NODE.md 3.1)."""
+
+    model_config = {"extra": "forbid"}
+    protocol: int
+    bundle: BlobRef
+    payload: BlobRef
+    entry: TaskEntry
+    client_python: str = ""
+
+    @field_validator("client_python")
+    @classmethod
+    def _client_python(cls, v: str) -> str:
+        if not CLIENT_PYTHON.fullmatch(v):
+            raise ValueError("client_python must be empty or 3.<minor>")
+        return v
+
+    @model_validator(mode="after")
+    def _sizes(self) -> "TaskSpec":
+        if self.bundle.size_bytes > MAX_BUNDLE_BYTES:
+            raise ValueError(f"bundle size_bytes must be at most {MAX_BUNDLE_BYTES}")
+        if self.payload.size_bytes > MAX_PAYLOAD_BYTES:
+            raise ValueError(f"payload size_bytes must be at most {MAX_PAYLOAD_BYTES}")
+        return self
+
+
 class JobAssignment(BaseModel):
     """One replica of a batch job or long-running service (DESIGN.md 25).
 
@@ -210,7 +274,7 @@ class JobAssignment(BaseModel):
     model_config = {"extra": "forbid"}
     job_id: str
     replica: int = Field(default=0, ge=0)
-    kind: str = "job"  # job (runs to completion) | service (long-running, has a port)
+    kind: str = "job"  # job (runs to completion) | service (long-running, has a port) | task
     image: str = Field(max_length=MAX_IMAGE_REF)
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
@@ -219,12 +283,13 @@ class JobAssignment(BaseModel):
     port: int = Field(default=0, ge=0, le=65535)  # 0 = no published port
     timeout_seconds: int = Field(default=0, ge=0)  # 0 = no node-side limit
     desired_phase: DesiredPhase = DesiredPhase.RUNNING
+    task: Optional[TaskSpec] = None  # present if and only if kind == "task"
 
     @field_validator("kind")
     @classmethod
     def _known_kind(cls, v: str) -> str:
-        if v not in ("job", "service"):
-            raise ValueError(f"job kind must be 'job' or 'service', got {v!r}")
+        if v not in ("job", "service", "task"):
+            raise ValueError("job kind must be 'job', 'service' or 'task'")
         return v
 
     @field_validator("image")
@@ -253,6 +318,17 @@ class JobAssignment(BaseModel):
         error = job_strings_error(self.args, self.env)
         if error:
             raise ValueError(error)
+        return self
+
+    @model_validator(mode="after")
+    def _task_shape(self) -> "JobAssignment":
+        if (self.kind == "task") != (self.task is not None):
+            raise ValueError("a task object is required for kind 'task' and allowed only there")
+        if self.task is not None:
+            if self.args != list(TASK_ARGV) or self.port != 0:
+                raise ValueError("a task runs the fixed runner command and publishes no port")
+            if self.task.protocol not in SUPPORTED_TASK_PROTOCOLS:
+                raise ValueError("unsupported task protocol")
         return self
 
     @property

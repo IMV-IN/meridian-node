@@ -119,3 +119,10 @@ class OfflineTransport:
 
     def rotate_certificate(self, node_id: str) -> dict:  # pragma: no cover - no live TLS offline
         return {"certificate": "", "trust_bundle": ""}
+
+    # Air-gapped nodes have no control plane to fetch from: tasks need a live session.
+    def fetch_task_blob(self, node_id, job_id, replica, kind, dest, max_bytes, session_id, epoch) -> tuple[str, int]:
+        raise ControlError("TASKS_DISABLED", "tasks need a live control-plane session")
+
+    def upload_task_result(self, node_id, job_id, replica, kind, data, digest, session_id, epoch) -> dict:
+        raise ControlError("TASKS_DISABLED", "tasks need a live control-plane session")

@@ -8,8 +8,10 @@ ownership-marker and lifecycle contract in memory.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
 
@@ -36,6 +38,15 @@ class JobLaunchRequest:
     port: int  # 0 = none published
     memory_limit_bytes: int
     ownership_marker: str  # "<node_id>:<job_key>:<operation_id>"
+    task_protocol: int = 0  # 0 = not a task; part of the journal digest
+
+
+class HelperRejected(RuntimeError):
+    """The helper answered with an error code (POLICY_DENIED, INVALID_REQUEST, ...)."""
+
+    def __init__(self, req_type: str, code: str, message: str):
+        super().__init__(f"helper rejected {req_type}: {code}: {message}")
+        self.code = code
 
 
 @dataclass
@@ -68,6 +79,10 @@ class Runtime(Protocol):
     def logs(self, runtime_id: str, max_bytes: int) -> str: ...
     def remove(self, runtime_id: str) -> None: ...
     def refresh_epoch(self, epoch: int) -> None: ...
+    def collect_task_result(self, job_key: str, runtime_id: str) -> dict:
+        """The exited task's one result file: {"kind": "result"|"error", "size", "digest", "data_b64"}
+        or {"kind": "none", "reason"} (docs/COMPUTE_TASKS_NODE.md 7.2)."""
+        ...
 
 
 @dataclass
@@ -77,6 +92,7 @@ class _FakeContainer:
     served_model: str = ""
     logs: str = ""
     job: Optional[JobLaunchRequest] = None
+    outputs: dict[str, bytes] = field(default_factory=dict)  # a task's /meridian/out
 
 
 class FakeRuntime:
@@ -87,6 +103,7 @@ class FakeRuntime:
         self._containers: dict[str, _FakeContainer] = {}
         self._counter = 0
         self.fencing_epoch = 0
+        self.collects = 0
 
     def refresh_epoch(self, epoch: int) -> None:
         self.fencing_epoch = epoch
@@ -142,7 +159,29 @@ class FakeRuntime:
     def remove(self, runtime_id: str) -> None:
         self._containers.pop(runtime_id, None)
 
+    def collect_task_result(self, job_key: str, runtime_id: str) -> dict:
+        """The helper's rules, over an in-memory output directory."""
+        c = self._containers.get(runtime_id)
+        if c is None or c.job is None or c.job.job_key != job_key or not c.job.task_protocol or c.status.alive:
+            raise HelperRejected("collect_task_result", "POLICY_DENIED", "not an exited task container")
+        self.collects += 1
+        if not c.outputs:
+            return {"kind": "none", "reason": "ResultMissing"}
+        if len(c.outputs) != 1 or next(iter(c.outputs)) not in ("result.json", "error.json"):
+            return {"kind": "none", "reason": "ResultInvalid"}
+        name, data = next(iter(c.outputs.items()))
+        if not data:
+            return {"kind": "none", "reason": "ResultInvalid"}
+        if len(data) > 1024 * 1024:
+            return {"kind": "none", "reason": "ResultTooLarge"}
+        return {"kind": name.removesuffix(".json"), "size": len(data),
+                "digest": "sha256:" + hashlib.sha256(data).hexdigest(), "data_b64": base64.b64encode(data).decode()}
+
     # --- test hooks -----------------------------------------------------
+    def write_output(self, runtime_id: str, name: str, data: bytes) -> None:
+        """What a task's runner leaves in /meridian/out."""
+        self._containers[runtime_id].outputs[name] = data
+
     def finish(self, runtime_id: str, exit_code: int = 0, logs: str = "") -> None:
         """A job container ran to completion."""
         c = self._containers[runtime_id]
@@ -201,7 +240,7 @@ class HelperRuntime:
             "payload": payload,
         })
         if not resp.get("ok"):
-            raise RuntimeError(f"helper rejected {req_type}: {resp}")
+            raise HelperRejected(req_type, str(resp.get("code", "")), str(resp.get("message", ""))[:500])
         return dict(resp)
 
     def launch(self, req: LaunchRequest) -> EngineHandle:
@@ -244,6 +283,8 @@ class HelperRuntime:
             "device_ids": list(req.device_ids), "port": req.port,
             "memory_limit_bytes": req.memory_limit_bytes, "ownership_marker": req.ownership_marker,
         }
+        if req.task_protocol:
+            payload["task"] = {"protocol": req.task_protocol}
         return str(self._request(f"launch_job:{req.ownership_marker}", "launch_job", payload)["result"])
 
     def logs(self, runtime_id: str, max_bytes: int) -> str:
@@ -252,6 +293,14 @@ class HelperRuntime:
 
     def remove(self, runtime_id: str) -> None:
         self._request(f"remove:{runtime_id}", "remove", {"runtime_id": runtime_id})
+
+    def collect_task_result(self, job_key: str, runtime_id: str) -> dict:
+        payload = {"job_key": job_key, "runtime_id": runtime_id}
+        resp = self._request(f"collect:{job_key}", "collect_task_result", payload)
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            raise HelperRejected("collect_task_result", "INVALID_RESPONSE", "not an object")
+        return result
 
     def refresh_epoch(self, epoch: int) -> None:
         """Tell the helper the epoch of a newly established session. It rejects

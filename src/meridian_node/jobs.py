@@ -19,19 +19,32 @@ the root helper checks it again before touching Docker.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
+import threading
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import IO, Optional, Sequence
 
-from .control import Transport
+from .control import ControlError, Transport
 from .journal import COMMITTED, OBSERVED, PLANNED, STARTED, Journal, JournalConflict
 from .models import JOB_TERMINAL, DesiredPhase, InvalidJob, JobAssignment, JobPhase, url_host, valid_host
 from .reservation import ReservationError, ReservationLedger
-from .runtime import JobLaunchRequest, Runtime
+from .runtime import HelperRejected, JobLaunchRequest, Runtime
+from .tasks import (
+    MAX_RESULT_BYTES,
+    SUPPORTED_TASK_PROTOCOLS,
+    TaskFailure,
+    digest_ok,
+    prepare_task,
+    remove_task_dir,
+    sweep_tasks_dir,
+)
 
 LOG_TAIL_BYTES = 8192
 # NUL and lone surrogates (undecodable bytes) are not text: shown as U+FFFD.
@@ -70,11 +83,14 @@ class JobPolicy:
     allowed_registries: frozenset[str] = frozenset()
     max_runtime_seconds: int = 0
     max_memory_bytes: int = 256 * 1024**3
+    tasks_enabled: bool = False
 
     def check(self, job: JobAssignment) -> Optional[str]:
         """Why this job may not run here, or None if it may."""
         if not self.enabled:
             return "jobs are disabled by this host's policy"
+        if job.kind == "task" and not self.tasks_enabled:
+            return "tasks are disabled by this host's policy"
         if job.memory_limit_bytes > self.max_memory_bytes:
             return f"memory limit above this host's maximum of {self.max_memory_bytes} bytes"
         if self.allowed_registries and job.registry not in self.allowed_registries:
@@ -100,6 +116,15 @@ class JobState:
     message: str = ""
     log_tail: str = ""
     timeout_seconds: int = field(default=0)
+    stage: str = "fetching"  # tasks only (docs/COMPUTE_TASKS_NODE.md 2)
+    # A task's collected result awaiting upload, and the outcome reported once it is accepted.
+    upload: Optional[tuple[str, bytes, str]] = None
+    outcome: Optional[tuple[JobPhase, str, str]] = None
+
+
+# Upload and fetch answers worth repeating; anything else from the control plane is final.
+_RETRY_CODES = frozenset({"CONTROL_UNAVAILABLE", "RATE_LIMITED", "STALE_AGENT_SESSION"})
+_NONE_REASONS = frozenset({"ResultMissing", "ResultInvalid", "ResultTooLarge"})
 
 
 class JobSupervisor:
@@ -113,6 +138,7 @@ class JobSupervisor:
         advertise_host: str = "127.0.0.1",
         now=_utcnow,
         executor: Optional[Executor] = None,
+        tasks_dir: Optional[Path] = None,
     ):
         if not valid_host(advertise_host):
             raise ValueError("advertise_host must be an IP address or a host name of at most 253 characters")
@@ -131,6 +157,10 @@ class JobSupervisor:
         # tick (heartbeat included) never waits on one; tests pass a synchronous executor.
         self._executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="job-launch")
         self._launches: dict[str, Future[str]] = {}
+        # Tasks: <state_dir>/tasks (None = this agent runs no tasks), in-flight fetches and uploads.
+        self.tasks_dir = tasks_dir
+        self._prepares: dict[str, tuple[Future[None], threading.Event]] = {}
+        self._uploads: dict[str, Future[dict]] = {}
 
     def state(self, key: str) -> Optional[JobState]:
         return self._states.get(key)
@@ -143,6 +173,8 @@ class JobSupervisor:
     def reconcile(self, desired: dict[str, JobAssignment]) -> None:
         """Advance every replica by at most one bounded step, idempotently."""
         self._sweep(desired)
+        if self.tasks_dir is not None:
+            sweep_tasks_dir(self.tasks_dir, set(desired))
         for key in [k for k in self._states if k not in desired]:
             self._forget(self._states[key])
         for key, job in desired.items():
@@ -150,7 +182,7 @@ class JobSupervisor:
             if st is None:
                 st = self._states[key] = JobState(
                     key=key, job_id=job.job_id, replica=job.replica, kind=job.kind, port=job.port,
-                    timeout_seconds=job.timeout_seconds,
+                    timeout_seconds=job.timeout_seconds, stage="fetching" if job.kind == "task" else "",
                 )
             self._step(st, job)
 
@@ -163,7 +195,10 @@ class JobSupervisor:
         if st.phase == JobPhase.PENDING:
             self._start(st, job)
         elif st.phase == JobPhase.STARTING:
-            self._collect(st)
+            if st.key in self._prepares:
+                self._prepared(st, job)
+            else:
+                self._collect(st)
         elif st.phase == JobPhase.RUNNING:
             self._observe(st)
 
@@ -188,15 +223,61 @@ class JobSupervisor:
 
     def _start(self, st: JobState, job: JobAssignment) -> None:
         denied = self.policy.check(job)
+        if denied is None and job.kind == "task" and not self.runs_tasks():
+            denied = "this agent is not set up to run tasks"
         if denied:
             self._finish(st, JobPhase.FAILED, "PolicyDenied", denied)
             return
+        if job.kind == "task" and self.journal.inspect(self._op(st)) is None:
+            # Never launched in any agent life: fetch and extract first, off the tick.
+            cancelled = threading.Event()
+            self._prepares[st.key] = (self._executor.submit(self._prepare, job, cancelled), cancelled)
+            st.phase, st.stage = JobPhase.STARTING, "fetching"
+            self._prepared(st, job)
+            return
+        self._launch(st, job)
+
+    def runs_tasks(self) -> bool:
+        return self.tasks_dir is not None and callable(getattr(self.runtime, "collect_task_result", None))
+
+    def _prepare(self, job: JobAssignment, cancelled: threading.Event) -> None:
+        assert self.tasks_dir is not None
+
+        def fetch(kind: str, dest: IO[bytes], max_bytes: int) -> tuple[str, int]:
+            transport = self.transport  # read per attempt: the session may be re-established meanwhile
+            if transport is None:
+                raise ControlError("NO_SESSION", "no control-plane session")
+            return transport.fetch_task_blob(
+                self.node_id, job.job_id, job.replica, kind, dest, max_bytes, self.session_id, self.fencing_epoch
+            )
+
+        prepare_task(job, self.tasks_dir, fetch, cancelled)
+
+    def _prepared(self, st: JobState, job: JobAssignment) -> None:
+        """Continue to the launch once the fetch and extraction have finished."""
+        fut, _ = self._prepares[st.key]
+        if not fut.done():
+            return
+        del self._prepares[st.key]
+        try:
+            fut.result()
+        except TaskFailure as e:
+            self._finish(st, JobPhase.FAILED, e.reason, e.message)
+            return
+        except Exception as e:  # a bug, not the bundle: never echo it
+            self._finish(st, JobPhase.FAILED, "BundleFetchFailed", f"could not prepare the task: {type(e).__name__}")
+            return
+        st.stage = "launching"
+        self._launch(st, job)
+
+    def _launch(self, st: JobState, job: JobAssignment) -> None:
         operation_id = self._op(st)
         marker = f"{self.node_id}:{st.key}:{operation_id}"
         req = JobLaunchRequest(
             job_key=st.key, image=job.image, args=tuple(job.args), env=dict(job.env),
             device_ids=tuple(job.device_ids), port=job.port,
             memory_limit_bytes=job.memory_limit_bytes, ownership_marker=marker,
+            task_protocol=job.task.protocol if job.task is not None else 0,
         )
         digest = "sha256:" + hashlib.sha256(
             json.dumps(req.__dict__, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -215,7 +296,7 @@ class JobSupervisor:
                 self._finish(st, JobPhase.FAILED, "ContainerLost", "the launched container no longer exists")
                 return
             self._hold(st, job)
-            st.phase = JobPhase.RUNNING
+            st.phase, st.stage = JobPhase.RUNNING, "running"
             st.started_at = st.started_at or self.now()
             self._observe(st)
             return
@@ -231,7 +312,7 @@ class JobSupervisor:
             self.journal.mark(operation_id, COMMITTED, result=adopted.runtime_id)
             st.runtime_id = adopted.runtime_id
             self._hold(st, job)
-            st.phase, st.started_at = JobPhase.RUNNING, self.now()
+            st.phase, st.stage, st.started_at = JobPhase.RUNNING, "running", self.now()
             return
 
         assert prior == PLANNED
@@ -241,7 +322,7 @@ class JobSupervisor:
             # Nothing was launched, so this op id is free to be retried by a resubmit.
             self._finish(st, JobPhase.FAILED, "LocalAdmissionRejected", str(e))
             return
-        st.phase = JobPhase.STARTING
+        st.phase, st.stage = JobPhase.STARTING, "launching"
         self.journal.mark(operation_id, STARTED)
         self._launches[st.key] = self._executor.submit(self.runtime.launch_job, req)
         self._collect(st)
@@ -259,7 +340,7 @@ class JobSupervisor:
             return
         self.journal.mark(self._op(st), OBSERVED, result=st.runtime_id)
         self.journal.mark(self._op(st), COMMITTED)
-        st.phase, st.started_at = JobPhase.RUNNING, self.now()
+        st.phase, st.stage, st.started_at = JobPhase.RUNNING, "running", self.now()
 
     def _hold(self, st: JobState, job: JobAssignment) -> None:
         try:
@@ -282,10 +363,92 @@ class JobSupervisor:
                 self._finish(st, JobPhase.FAILED, "Timeout", f"exceeded the {limit}s runtime limit")
             return
         st.exit_code = status.exit_code
+        if st.kind == "task":
+            self._settle_task(st)
+            return
         if status.exit_code == 0:
             self._finish(st, JobPhase.SUCCEEDED, "Completed", "")
         else:
             self._finish(st, JobPhase.FAILED, "NonZeroExit", f"exit code {status.exit_code}")
+
+    # --- tasks: collection and upload (docs/COMPUTE_TASKS_NODE.md 8) -----
+    def _settle_task(self, st: JobState) -> None:
+        """The task container exited: collect its one result file, upload it,
+        and only then report the terminal phase."""
+        if st.upload is not None:
+            self._uploaded(st)
+            return
+        assert st.runtime_id is not None
+        st.stage = "collecting"
+        try:
+            res = self.runtime.collect_task_result(st.key, st.runtime_id)
+        except HelperRejected as e:
+            if e.code == "BACKEND_ERROR":
+                return  # retried on the next tick
+            # The output directory is gone or not the task user's (for example after a host reboot).
+            self._finish(st, JobPhase.FAILED, "ResultMissing", "the task output could not be read")
+            return
+        except Exception:
+            return  # the helper is unreachable; retried on the next tick
+        exit_note = f"exit code {st.exit_code}"
+        kind = res.get("kind")
+        if kind == "none":
+            reason = res.get("reason")
+            self._finish(st, JobPhase.FAILED, reason if reason in _NONE_REASONS else "ResultInvalid", exit_note)
+            return
+        if kind not in ("result", "error"):
+            self._finish(st, JobPhase.FAILED, "ResultInvalid", "the helper returned an unknown result kind")
+            return
+        if kind == "result" and st.exit_code != 0:
+            self._finish(st, JobPhase.FAILED, "ResultInvalid", f"result.json written but {exit_note}")
+            return
+        data = _verified_result(res)
+        if data is None:
+            self._finish(st, JobPhase.FAILED, "ResultInvalid", "the collected result failed verification")
+            return
+        st.upload = (kind, data, res["digest"])
+        st.outcome = (
+            (JobPhase.SUCCEEDED, "Completed", "") if kind == "result" else (JobPhase.FAILED, "NonZeroExit", exit_note)
+        )
+        self._submit_upload(st)
+
+    def _submit_upload(self, st: JobState) -> None:
+        assert st.upload is not None
+        st.stage = "uploading"
+        self._uploads[st.key] = self._executor.submit(self._upload, st.job_id, st.replica, *st.upload)
+
+    def _upload(self, job_id: str, replica: int, kind: str, data: bytes, digest: str) -> dict:
+        transport = self.transport
+        if transport is None:
+            raise ControlError("CONTROL_UNAVAILABLE", "no control-plane session", retryable=True)
+        return transport.upload_task_result(
+            self.node_id, job_id, replica, kind, data, digest, self.session_id, self.fencing_epoch
+        )
+
+    def _uploaded(self, st: JobState) -> None:
+        fut = self._uploads.get(st.key)
+        if fut is None:
+            self._submit_upload(st)
+            return
+        if not fut.done():
+            return
+        del self._uploads[st.key]
+        try:
+            fut.result()
+        except ControlError as e:
+            if e.code == "TASK_FINISHED":
+                pass  # the control plane no longer wants it; report anyway
+            elif e.retryable or e.code in _RETRY_CODES:
+                self._submit_upload(st)
+                return
+            else:
+                self._finish(st, JobPhase.FAILED, "ResultUploadRejected", f"the control plane refused it: {e.code}")
+                return
+        except Exception:
+            self._submit_upload(st)  # a network error: retried until the control plane's deadlines stop it
+            return
+        assert st.outcome is not None
+        self._finish(st, *st.outcome)
 
     def _cancel(self, st: JobState) -> None:
         self._teardown(st, remove=False)
@@ -296,6 +459,10 @@ class JobSupervisor:
         """Stop (and optionally remove) the replica's container. An in-flight launch is awaited so
         its container is not leaked; after an agent restart the id comes from the journal."""
         self._collect(st, wait=True)
+        prepare = self._prepares.pop(st.key, None)
+        if prepare is not None:
+            prepare[1].set()  # the fetch stops at its next chunk and removes its directory
+        self._uploads.pop(st.key, None)  # no upload after a cancel; a request in flight is answered harmlessly
         if st.runtime_id is None:
             row = self.journal.inspect(self._op(st))
             st.runtime_id = row.result if row else None
@@ -314,7 +481,8 @@ class JobSupervisor:
             self.runtime.remove(st.runtime_id)
 
     def _finish(self, st: JobState, phase: JobPhase, reason: str, message: str) -> None:
-        st.phase, st.reason, st.message = phase, reason, message
+        st.phase, st.reason, st.message, st.stage = phase, reason, message, "done"
+        st.upload = None
         st.finished_at = self.now()
         self.reservations.release(self._owner(st))
 
@@ -324,6 +492,11 @@ class JobSupervisor:
             self._teardown(st, remove=True)
         except Exception:
             pass  # best effort; a leftover exited container holds no GPU
+        if st.kind == "task" and self.tasks_dir is not None:
+            try:
+                remove_task_dir(self.tasks_dir, st.key)
+            except OSError:
+                pass  # the per-reconcile sweep retries
         self.reservations.release(self._owner(st))
         del self._states[st.key]
 
@@ -346,6 +519,7 @@ class JobSupervisor:
                 "message": bounded_text(st.message, MESSAGE_BYTES, "head"),
                 "started_at": _iso(st.started_at), "finished_at": _iso(st.finished_at),
                 "endpoint": endpoint, "log_tail": st.log_tail,
+                **({"task": {"stage": st.stage}} if st.kind == "task" else {}),
             })
         return out
 
@@ -357,6 +531,9 @@ class JobSupervisor:
             "job_port_range": [self.reservations.job_port_range.start, self.reservations.job_port_range.stop],
             "free_job_ports": self.reservations.free_job_ports(),
             "running_jobs": sum(1 for s in self._states.values() if s.phase == JobPhase.RUNNING),
+            # The control plane places a task only where its protocol is listed (docs/COMPUTE_TASKS_NODE.md 3.2).
+            **({"task_protocols": list(SUPPORTED_TASK_PROTOCOLS)}
+               if self.policy.enabled and self.policy.tasks_enabled and self.runs_tasks() else {}),
         }
 
 
@@ -373,6 +550,19 @@ def rejected_observations(
             "message": bounded_text(message, MESSAGE_BYTES, "head"),
             "started_at": None, "finished_at": stamp,
             "endpoint": "", "log_tail": "",
+            **({"task": {"stage": "done"}} if getattr(j, "kind", "") == "task" else {}),
         }
         for j in jobs
     ]
+
+
+def _verified_result(res: dict) -> Optional[bytes]:
+    """The collected bytes, if they match the size and digest the helper reported."""
+    try:
+        data = base64.b64decode(res.get("data_b64", ""), validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return None
+    digest = res.get("digest")
+    if not (0 < len(data) <= MAX_RESULT_BYTES) or res.get("size") != len(data) or not digest_ok(digest):
+        return None
+    return data if "sha256:" + hashlib.sha256(data).hexdigest() == digest else None

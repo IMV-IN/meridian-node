@@ -12,6 +12,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from .helper import MOUNT_PATH
 from .models import valid_host
 
 MODES = ("observe-only", "managed-host", "kubernetes-integrated", "air-gapped")
@@ -63,6 +64,18 @@ class Policy(BaseModel):
     job_memory_max_bytes: int = Field(default=256 * 1024**3, gt=0)
     # CPUs one job container may use (docker --cpus); 0 = no limit.
     job_cpus: float = Field(default=0.0, ge=0)
+    # --- compute tasks (docs/COMPUTE_TASKS_NODE.md 4) ---------------------
+    # A task runs a researcher's Python function from a bundle the control plane
+    # serves. Off by default; needs jobs_enabled.
+    tasks_enabled: bool = False
+    # The container user. Never root: the image's own user is ignored.
+    task_uid: int = Field(default=65534, ge=1, le=2_147_483_647)
+    task_gid: int = Field(default=65534, ge=1, le=2_147_483_647)
+    # The container's /tmp tmpfs (charged to its memory cap) and /dev/shm.
+    task_tmp_bytes: int = Field(default=4 * 1024**3, ge=64 * 1024**2)
+    task_shm_bytes: int = Field(default=1024**3, ge=64 * 1024**2)
+    # Root-only directory where the helper mounts each task's 2 MiB output tmpfs.
+    task_out_root: str = "/var/lib/meridian-node-helper/task-out"
 
     @field_validator("port_range", "job_port_range")
     @classmethod
@@ -78,6 +91,13 @@ class Policy(BaseModel):
             ipaddress.ip_address(v)  # ValueError: "... does not appear to be an IPv4 or IPv6 address"
         return v
 
+    @field_validator("task_out_root")
+    @classmethod
+    def _valid_task_out_root(cls, v: str) -> str:
+        if not MOUNT_PATH.fullmatch(v) or ".." in v.split("/") or "." in v.split("/") or "//" in v:
+            raise ValueError("task_out_root must be an absolute path of [A-Za-z0-9._/+-] without '.' or '..'")
+        return v
+
     @field_validator("engine_host")
     @classmethod
     def _valid_engine_host(cls, v: str) -> str:
@@ -87,6 +107,8 @@ class Policy(BaseModel):
 
     @model_validator(mode="after")
     def _job_limits(self) -> "Policy":
+        if self.tasks_enabled and not self.jobs_enabled:
+            raise ValueError("tasks_enabled requires jobs_enabled")
         if self.job_memory_default_bytes > self.job_memory_max_bytes:
             raise ValueError("job_memory_default_bytes must not exceed job_memory_max_bytes")
         if self.jobs_enabled:
@@ -167,11 +189,17 @@ class Config(BaseModel):
                 raise ValueError("air-gapped mode requires at least one air_gap.authority_keys entry")
         elif not self.control_plane_url:
             raise ValueError("control_plane_url is required")
+        out, state = Path(self.policy.task_out_root), self.state_dir.absolute()
+        if out == state or out.is_relative_to(state) or state.is_relative_to(out):
+            raise ValueError("policy.task_out_root must not be inside state_dir (the agent owns state_dir)")
         return self
 
     def jobs_allowed(self) -> bool:
         """Jobs need managed lifecycle control plus the separate jobs switch."""
         return self.managed_allowed() and self.policy.jobs_enabled
+
+    def tasks_allowed(self) -> bool:
+        return self.jobs_allowed() and self.policy.tasks_enabled
 
     def managed_allowed(self) -> bool:
         """Managed lifecycle requires an engine-launching mode plus the local
